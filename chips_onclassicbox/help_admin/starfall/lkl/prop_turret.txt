@@ -1,0 +1,1215 @@
+--@name Prop Turret
+--@author legokidlogan
+--@shared
+--@include lkl/placeable.txt
+--@include lkl/global_whitelist.txt
+--@include lkl/prop_buffer.txt
+--@include lkl/math/vector_math.txt
+
+--[[
+    - TODO
+--]]
+
+if PropTurret then return end
+
+glist = glist or {}
+glist.groupName = glist.groupName or "turret"
+glist.startupSyncDelay = glist.startupSyncDelay or 2
+
+require( "lkl/placeable.txt" )
+require( "lkl/global_whitelist.txt" )
+
+if SERVER then
+    propBuffer = propBuffer or {}
+    propBuffer.storePos = propBuffer.storePos or Vector( 0, 0, -4000 )
+
+    require( "lkl/prop_buffer.txt" )
+    require( "lkl/math/vector_math.txt" )
+end
+
+
+
+PropTurret = class( "PropTurret", Placeable )
+
+-- These static vars cannot be overriden by subclasses. The value will only be read from the PropTurret class, and will the affect behavior of all subclasses.
+PropTurret.static.REDUCE_CONSTRAINTS = true -- If true, bullets will have COLLISION_GROUP_INTERACTIVE_DEBRIS and will not create nocollide constraints between each other.
+
+-- These static vars can be overridden by subclasses.
+PropTurret.static.BULLET_MODEL = "models/hunter/plates/plate.mdl"
+PropTurret.static.BULLET_BUFFER_SIZE = 10
+PropTurret.static.AUTO_TARGET_INTERVAL = 0.5 -- How often the turret should auto target.
+
+-- These can be overridden by subclasses, as well as set on a per-instance basis.
+PropTurret.static.BULLET_GRAVITY_ENABLED = true
+PropTurret.static.BULLET_SPEED = 3000
+PropTurret.static.BULLET_MASS = 4
+PropTurret.static.BULLET_COUNT = 1
+PropTurret.static.BULLET_SPREAD = 0 -- 0-2 fraction, corresponds to 0-360 degrees, i.e. a hemisphere at 1 cone. Set to 2 to force a full sphere.
+PropTurret.static.BULLET_LINGER = 3 -- How long bullets should stay in the world before being removed.
+PropTurret.static.BULLET_COLOR = Color( 255, 255, 255, 255 )
+PropTurret.static.BULLET_MATERIAL = ""
+
+PropTurret.static.AUTO_TARGET_CONE = 2 -- 0-1 fraction, corresponds to 0-180 degrees, i.e. a hemisphere at 1 cone. Set to 2 to force a full sphere.
+PropTurret.static.AUTO_TARGET_RANGE = 1000 -- How far the turret can see for auto targeting.
+PropTurret.static.AUTO_TARGET_VEHICLES = 0 -- 0 = don't target vehicles, 1 = only target vehicles, 2 = target vehicles and players.
+
+PropTurret.static.TARGET_VEL_ACCOUNT = 1 -- Multiplier for adding the target's velocity when firing shots. Also gets affected by bullet speed and distance.
+PropTurret.static.SHOOT_COOLDOWN = 0.5
+
+
+local COLLISION_GROUP_NONE = COLLISION_GROUP.NONE
+local COLLISION_GROUP_DEBRIS = COLLISION_GROUP.DEBRIS
+local COLLISION_GROUP_DEBRIS_TRIGGER = COLLISION_GROUP.DEBRIS_TRIGGER
+local COLLISION_GROUP_INTERACTIVE_DEBRIS = COLLISION_GROUP.INTERACTIVE_DEBRIS
+local COLLISION_GROUP_INTERACTIVE = COLLISION_GROUP.INTERACTIVE
+local COLLISION_GROUP_IN_VEHICLE = COLLISION_GROUP.IN_VEHICLE
+local COLLISION_GROUP_WORLD = COLLISION_GROUP.WORLD
+
+local startupSyncComplete = false
+local allTurrets = {}
+local turretsByClass = {}
+local bulletModelLookup = {}
+local turretClasses = {}
+local turretClassLookup = {}
+local bulletPassableCollisionGroups = {
+    [COLLISION_GROUP_DEBRIS] = true,
+    [COLLISION_GROUP_DEBRIS_TRIGGER] = true,
+    [COLLISION_GROUP_INTERACTIVE_DEBRIS] = true,
+    [COLLISION_GROUP_INTERACTIVE] = true,
+    [COLLISION_GROUP_IN_VEHICLE] = true,
+    [COLLISION_GROUP_WORLD] = true,
+}
+local registerTurretClass
+local getRootParent
+
+
+----- STATIC FUNCTIONS -----
+
+-- Gets the head position of a player, or the center of the bounding box if it's not a player.
+function PropTurret.static:getEntHeadPos( ent )
+    if not ent:isPlayer() then
+        return ent:obbCenterW()
+    end
+
+    local bone = ent:lookupBone( "ValveBiped.Bip01_Head1" )
+
+    if not bone then
+        bone = ent:lookupBone( "Head" )
+    end
+
+    if not bone then
+        bone = ent:lookupBone( "head" )
+    end
+
+    if bone then return ent:getBonePosition( bone ) end
+
+    return ent:getEyePos()
+end
+
+function PropTurret.static:getAll()
+    return allTurrets
+end
+
+if SERVER then
+    function PropTurret:initialize( replicatedOnClient, pos, ang, headPos, headAng, ... )
+        PropTurret.super.initialize( self, replicatedOnClient, pos, ang, headPos, headAng, ... )
+
+        if not turretClassLookup[self.class] then
+            registerTurretClass( self.class )
+        end
+
+        local bulletModel = self:getBulletModel()
+        propBuffer.registerModel( bulletModel, self.class.BULLET_BUFFER_SIZE )
+        bulletModelLookup[bulletModel] = true
+
+        table.insert( allTurrets, self )
+        table.insert( turretsByClass[self.class], self )
+        self._isOnShotCooldown = false
+
+        self._registeredProps = {}
+        self._registeredPropLookup = {}
+        self._activeBullets = {}
+
+        self:setHeadAngleLimits( -89.9, 89.9, -180, 180 )
+        self:setHeadPos( headPos )
+        self:setHeadAngles( headAng )
+        self:setShootPos( Vector() )
+        self:setAutoTarget( true )
+        self:setAutoShoot( true )
+        self:setTargetNPCs( false )
+    end
+else
+    function PropTurret:initialize( _, pos, ang, headPos, headAng, ... )
+        PropTurret.super.initialize( self, _, pos, ang, headPos, headAng, ... )
+
+        table.insert( allTurrets, self )
+
+        self:setHeadAngleLimits( -89.9, 89.9, -180, 180 )
+        self:setHeadPos( headPos )
+        self:setHeadAngles( headAng )
+        self:setShootPos( Vector() )
+        self:setAutoTarget( true )
+    end
+end
+
+
+----- INSTANCE FUNCTIONS -----
+
+function PropTurret:doesAutoTarget()
+    return self._autoTarget
+end
+
+function PropTurret:getTarget()
+    return self._target
+end
+
+function PropTurret:getHeadPos()
+    return self._headPos
+end
+
+function PropTurret:getHeadWorldPos()
+    return self:localToWorld( self:getHeadPos() )
+end
+
+function PropTurret:getHeadAngles()
+    return self._headAng
+end
+
+function PropTurret:getHeadWorldAngles()
+    return self:localToWorldAngles( self:getHeadAngles() )
+end
+
+function PropTurret:getHeadWorldPosAng()
+    return self:localToWorldPosAng( self:getHeadPos(), self:getHeadAngles() )
+end
+
+function PropTurret:getShootPos()
+    return self._shootPos
+end
+
+function PropTurret:getShootWorldPos()
+    local headPos, headAng = self:getHeadWorldPosAng()
+    local pos = localToWorld( self:getShootPos(), Angle(), headPos, headAng )
+
+    return pos
+end
+
+
+if SERVER then
+    function PropTurret:setAutoTarget( enabled )
+        if type( enabled ) ~= "boolean" then error( "Expected enabled to be a boolean" ) end
+        if self._autoTarget == enabled then return end
+
+        self._autoTarget = enabled
+        self:syncProperty( "PropTurret_AutoTarget", enabled )
+        self:onAutoTargetChanged()
+    end
+
+    function PropTurret:setTarget( target )
+        if target ~= nil and not isValid( target ) then error( "Expected target to be nil or valid" ) end
+
+        local prevTarget = self._target
+        if prevTarget == target then return end
+
+        self._target = target
+        self:syncProperty( "PropTurret_Target", target or game.getWorld() )
+        self:onSetTarget( prevTarget )
+    end
+
+    function PropTurret:setAutoShoot( state )
+        if state == nil then
+            self._autoShoot = nil
+
+            return
+        end
+
+        if type( state ) ~= "boolean" then error( "Expected state to be a boolean or nil" ) end
+
+        self._autoShoot = state
+    end
+
+    function PropTurret:doesAutoShoot()
+        return self._autoShoot
+    end
+
+    -- Target NPCs instead of players.
+    function PropTurret:setTargetNPCs( state )
+        if state == nil then
+            self._targetNPCs = nil
+
+            return
+        end
+
+        if type( state ) ~= "boolean" then error( "Expected state to be a boolean or nil" ) end
+
+        self._targetNPCs = state
+    end
+
+    function PropTurret:doesTargetNPCs()
+        return self._targetNPCs
+    end
+
+    function PropTurret:shoot()
+        if not self:canShoot() then return end
+
+        local selfObj = self
+        local cooldown = self:getShootCooldown()
+        local bulletHasGravity = self:isBulletGravityEnabled()
+        local bulletModel = self:getBulletModel()
+        local bulletMass = self:getBulletMass()
+        local bulletSpeed = self:getBulletSpeed()
+        local bulletColor = self:getBulletColor()
+        local bulletMaterial = self:getBulletMaterial()
+        local bulletCollisionGroup = PropTurret.REDUCE_CONSTRAINTS and COLLISION_GROUP_INTERACTIVE_DEBRIS or COLLISION_GROUP_NONE
+        local bullets = {}
+        local shootPos = self:getShootWorldPos()
+        local shootDir = self:_getShootDir()
+
+        self._isOnShotCooldown = true
+
+        for i = 1, self:getBulletCount() do
+            local bullet = propBuffer.takeProp( bulletModel )
+            if not bullet then continue end
+
+            local dir = self:_spreadDir( shootDir )
+
+            bullets[i] = bullet
+
+            bullet:setPos( shootPos )
+            bullet:setAngles( dir:getAngle() )
+            bullet:setMass( bulletMass )
+            bullet:setColor( bulletColor )
+            bullet:setMaterial( bulletMaterial )
+            bullet:setCollisionGroup( bulletCollisionGroup )
+            bullet:enableMotion( true )
+            bullet:getPhysicsObject():setVelocity( dir * bulletSpeed )
+            bullet:enableGravity( bulletHasGravity )
+
+            bullet:addCollisionListener( function( colData )
+                if not isValid( bullet ) then return end -- Starfall callback is late, so explosive props might become invalid at this point.
+                if bullet._propTurret_HasCollided then return end -- Collision listener sometimes calls twice before it can be removed.
+
+                bullet._propTurret_HasCollided = true
+                bullet:removeCollisionListener()
+
+                if isValid( selfObj ) then
+                    selfObj:onBulletImpact( bullet, colData )
+                end
+            end )
+        end
+
+        timer.simple( self:getBulletLinger(), function()
+            local activeBullets = self._activeBullets
+
+            -- Store the bullets.
+            for _, bullet in ipairs( bullets ) do
+                propBuffer.storeProp( bullet )
+                table.removeByValue( activeBullets, bullet )
+
+                if isValid( bullet ) then
+                    bullet._propTurret_HasCollided = nil
+
+                    if isValid( self ) then
+                        self:onStoreBullet( bullet )
+                    end
+
+                    pcall( function()
+                        bullet:removeCollisionListener()
+                    end )
+                end
+            end
+
+            -- Remove any invalid bullets from the active list.
+            for i = #activeBullets, 1 do
+                if not isValid( activeBullets[i] ) then
+                    table.remove( activeBullets, i )
+                end
+            end
+        end )
+
+        timer.create( self:getTimerName( "LKL_PropTurret_CooldownFinished" ), cooldown, 1, function()
+            self._isOnShotCooldown = false
+        end )
+
+        table.add( self._activeBullets, bullets )
+        self:onShoot( bullets )
+
+        if self:isReplicatedOnClient() then
+            net.start( "LKL_PropTurret_Shoot" )
+            net.writeUInt( self:getID(), 16 )
+            net.writeTable( bullets )
+            net.send()
+        end
+    end
+
+    -- Get all bullets fired by this turret that haven't been stored (despawned) yet.
+    function PropTurret:getActiveBullets()
+        return self._activeBullets
+    end
+
+    --[[
+        - Returns a sorted list of valid targets in a cone/sphere from the PropTurret's head depending on its settings.
+        - Line of sight is not checked.
+    --]]
+    function PropTurret:getTargetsInCone()
+        local cone = self:getAutoTargetCone()
+        if cone == 2 then return self:getTargetsInSphere() end
+
+        local sphereTargets = self:getTargetsInSphere()
+        local targets = {}
+        local targetCount = 0
+        local dotThreshold = 1 - cone
+        local pos = self:getShootWorldPos()
+        local dir = self:getHeadWorldAngles():getForward()
+
+        for _, target in ipairs( sphereTargets ) do
+            local toTarget = self:getAimPosForTarget( target ) - pos
+            local dot = toTarget:getNormalized():dot( dir )
+
+            if dot >= dotThreshold then
+                targetCount = targetCount + 1
+                targets[targetCount] = { ply = target, dot = dot }
+            end
+        end
+
+        table.sortByMember( targets, "dot", false )
+
+        for i = targetCount + 1, #targets do
+            targets[i] = targets[i].ply
+        end
+
+        return targets
+    end
+
+    --[[
+        - Returns a sorted list of valid targets in a sphere from the PropTurret's head depending on its settings.
+        - Ignores the AUTO_TARGET_CONE setting.
+        - Line of sight is not checked.
+    --]]
+    function PropTurret:getTargetsInSphere()
+        local pos = self:getHeadWorldPos()
+        local rangeSqr = self:getAutoTargetRange() ^ 2
+        local filter = self.targetFilter
+        local selfObj = self
+
+        local function filterFunc( ent )
+            if not ent.getPos or ent:getPos():getDistanceSqr( pos ) > rangeSqr then return false end
+
+            return filter( selfObj, ent )
+        end
+
+        local targets
+
+        -- Use find.allPlayers() and find.byClass() instead of find.inSphere() due to its internal 512 ent limit prior to getting the lua filter.
+        if self:doesTargetNPCs() then
+            targets = find.all( filterFunc )
+        else
+            targets = find.allPlayers( filterFunc )
+        end
+
+        targets = find.sortByClosest( targets, pos )
+
+        return targets
+    end
+
+    --[[
+        - Returns whether or not the PropTurret can see the given entity.
+
+        ent: (Entity)
+            - The Entity to check.
+    --]]
+    function PropTurret:canSee( ent )
+        if not isValid( ent ) then return false end
+
+        local startPos = self:getHeadWorldPos()
+        local endPos = ent:obbCenterW()
+
+        local filter = {}
+        table.add( filter, self:getProps() )
+        table.add( filter, propBuffer.getProps( self:getBulletModel() ) )
+        table.add( filter, self:getExtraTraceFilterEnts() )
+
+        -- Trace for the player's vehicle if they're in one.
+        if ent.isPlayer and ent:isPlayer() and ent:inVehicle() then
+            local vehicle = ent:getVehicle()
+
+            table.add( filter, vehicle:getAllConstrained() )
+        end
+
+        local tr = trace.line( startPos, endPos, filter )
+
+        return not tr.Hit or tr.Entity == ent
+    end
+
+    --[[
+        - Returns the list of entities that have been registered as being part of the PropTurret.
+        - This is used for filtering the props from line of sight traces.
+        - Register entities with :registerProp() and deregister them with :deregisterProp().
+    --]]
+    function PropTurret:getProps()
+        return self._registeredProps
+    end
+
+    --[[
+        - Registers an entity as being part of the PropTurret.
+        - This is used for filtering the props from line of sight traces.
+        - If PropTurret.REDUCE_CONSTRAINTS is true, then be sure to not change the entity's collision group after registering it.
+    --]]
+    function PropTurret:registerProp( ent )
+        if not isValid( ent ) then return end
+        if self._registeredPropLookup[ent] then return end
+
+        local bullets = propBuffer.getProps( self:getBulletModel() )
+
+        self._registeredPropLookup[ent] = true
+        table.insert( self._registeredProps, ent )
+
+        -- Reduce constraints if possible.
+        if PropTurret.REDUCE_CONSTRAINTS and bulletPassableCollisionGroups[ent:getCollisionGroup()] then return end
+
+        for _, bullet in ipairs( bullets ) do
+            constraint.nocollide( ent, bullet )
+        end
+    end
+
+    --[[
+        - Deregisters an entity as being part of the PropTurret.
+        - This is used for filtering the props from line of sight traces.
+    --]]
+    function PropTurret:deregisterProp( ent )
+        if not isValid( ent ) then return end
+        if not self._registeredPropLookup[ent] then return end
+
+        self._registeredPropLookup[ent] = nil
+        table.removeByValue( self._registeredProps, ent )
+    end
+
+    --[[
+        - Sets the head position of the PropTurret, which is in local coords to the PropTurret.
+        - The head position is used as the origin for target detection.
+    --]]
+    function PropTurret:setHeadPos( pos )
+        if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+        local prevHeadPos = self._headPos
+        if prevHeadPos == pos then return end
+
+        self._headPos = pos
+        self:syncProperty( "PropTurret_HeadPos", pos )
+        self:onSetHeadPos( prevHeadPos )
+    end
+
+    --[[
+        - Sets the head angles of the PropTurret, which is in local coords to the PropTurret.
+        - The head angles are used as the cone direction for target detection.
+    --]]
+    function PropTurret:setHeadAngles( ang )
+        if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+        local prevHeadAng = self._headAng
+        if prevHeadAng == ang then return end
+
+        local pitchMin, pitchMax, yawMin, yawMax = self:getHeadAngleLimits()
+        local pitch = math.clamp( ang[1], pitchMin, pitchMax )
+        local yaw = math.clamp( ang[2], yawMin, yawMax )
+
+        ang = Angle( pitch, yaw, ang[3] )
+        if prevHeadAng == ang then return end
+
+        self._headAng = ang
+        self:syncProperty( "PropTurret_HeadAngles", ang )
+        self:onSetHeadAngles( prevHeadAng )
+    end
+
+    --[[
+        - Changes the PropTurret's head angles to aim at the given position.
+    --]]
+    function PropTurret:aimAt( pos )
+        if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+        local headPos = self:getHeadWorldPos()
+        local ang = ( pos - headPos ):getAngle()
+        ang = self:worldToLocalAngles( ang )
+
+        self:setHeadAngles( ang )
+    end
+
+    --[[
+        - Sets the shoot offset of the PropTurret, which is in local coords to the PropTurret's head.
+        - Bullets will spawn from here.
+    --]]
+    function PropTurret:setShootPos( pos )
+        if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+        local prevShootPos = self._shootPos
+        if prevShootPos == pos then return end
+
+        self._shootPos = pos
+        self:syncProperty( "PropTurret_ShootPos", pos )
+        self:onSetShootPos( prevShootPos )
+    end
+
+    --[[
+        - Sets the pitch and yaw limits for the head of the PropTurret.
+        - Note that the roll has no limit.
+    --]]
+    function PropTurret:setHeadAngleLimits( pitchMin, pitchMax, yawMin, yawMax )
+        if pitchMin == nil and pitchMax == nil and yawMin == nil and yawMax == nil then
+            self._headPitchMin = nil
+            self._headPitchMax = nil
+            self._headYawMin = nil
+            self._headYawMax = nil
+
+            return
+        end
+
+        if type( pitchMin ) ~= "number" then error( "Expected pitchMin to be a number" ) end
+        if type( pitchMax ) ~= "number" then error( "Expected pitchMax to be a number" ) end
+        if type( yawMin ) ~= "number" then error( "Expected yawMin to be a number" ) end
+        if type( yawMax ) ~= "number" then error( "Expected yawMax to be a number" ) end
+        if pitchMin > pitchMax then error( "pitchMin cannot be greater than pitchMax" ) end
+        if yawMin > yawMax then error( "yawMin cannot be greater than yawMax" ) end
+        if pitchMin < -89.9 or pitchMin > 89.9 then error( "pitchMin must be between -89.9 and 89.9" ) end
+        if pitchMax < -89.9 or pitchMax > 89.9 then error( "pitchMax must be between -89.9 and 89.9" ) end
+        if yawMin < -180 or yawMin > 180 then error( "yawMin must be between -180 and 180" ) end
+        if yawMax < -180 or yawMax > 180 then error( "yawMax must be between -180 and 180" ) end
+
+        self._headPitchMin = pitchMin
+        self._headPitchMax = pitchMax
+        self._headYawMin = yawMin
+        self._headYawMax = yawMax
+    end
+
+    function PropTurret:getHeadAngleLimits()
+        return self._headPitchMin, self._headPitchMax, self._headYawMin, self._headYawMax
+    end
+
+    function PropTurret:setAutoTargetCone( coneFraction )
+        if coneFraction == nil then
+            self._autoTargetCone = nil
+
+            return
+        end
+
+        if type( coneFraction ) ~= "number" then error( "Expected coneFraction to be a number or nil" ) end
+        if coneFraction < 0 or coneFraction > 2 then error( "coneFraction must be between 0 and 2" ) end
+
+        self._autoTargetCone = coneFraction
+    end
+
+    function PropTurret:getAutoTargetCone()
+        return self._autoTargetCone or self.class.AUTO_TARGET_CONE
+    end
+
+    function PropTurret:setAutoTargetRange( range )
+        if range == nil then
+            self._autoTargetRange = nil
+
+            return
+        end
+
+        if type( range ) ~= "number" then error( "Expected range to be a number or nil" ) end
+        if range <= 0 then error( "range must be > 0" ) end
+
+        self._autoTargetRange = range
+    end
+
+    function PropTurret:getAutoTargetRange()
+        return self._autoTargetRange or self.class.AUTO_TARGET_RANGE
+    end
+
+    function PropTurret:setVehicleTargetMode( mode )
+        if mode == nil then
+            self._vehicleTargetMode = nil
+
+            return
+        end
+
+        if type( mode ) ~= "number" then error( "Expected mode to be a number or nil" ) end
+        if mode ~= 0 and mode ~= 1 and mode ~= 2 then error( "mode must be 0, 1, or 2" ) end
+
+        self._vehicleTargetMode = mode
+    end
+
+    function PropTurret:getVehicleTargetMode()
+        return self._vehicleTargetMode or self.class.AUTO_TARGET_VEHICLES
+    end
+
+    function PropTurret:setBulletGravityEnabled( state )
+        if type( state ) ~= "boolean" then error( "Expected state to be a boolean" ) end
+
+        self._bulletGravityEnabled = state
+    end
+
+    function PropTurret:isBulletGravityEnabled()
+        local state = self._bulletGravityEnabled
+        if state == nil then return self.class.BULLET_GRAVITY_ENABLED end
+
+        return state
+    end
+
+    function PropTurret:setBulletSpeed( speed )
+        if speed == nil then
+            self._bulletSpeed = nil
+
+            return
+        end
+
+        if type( speed ) ~= "number" then error( "Expected speed to be a number or nil" ) end
+        if speed <= 0 then error( "speed must be > 0" ) end
+
+        self._bulletSpeed = speed
+    end
+
+    function PropTurret:getBulletSpeed()
+        return self._bulletSpeed or self.class.BULLET_SPEED
+    end
+
+    function PropTurret:setBulletMass( mass )
+        if mass == nil then
+            self._bulletMass = nil
+
+            return
+        end
+
+        if type( mass ) ~= "number" then error( "Expected mass to be a number or nil" ) end
+        if mass <= 0 then error( "mass must be > 0" ) end
+
+        self._bulletMass = math.min( mass, 50000 )
+    end
+
+    function PropTurret:getBulletMass()
+        return self._bulletMass or self.class.BULLET_MASS
+    end
+
+    function PropTurret:setBulletCount( count )
+        if count == nil then
+            self._bulletCount = nil
+
+            return
+        end
+
+        if type( count ) ~= "number" then error( "Expected count to be a number or nil" ) end
+        if math.floor( count ) ~= count then error( "count must be an integer" ) end
+        if count <= 0 then error( "count must be > 0" ) end
+
+        self._bulletCount = math.min( count, 100 )
+    end
+
+    function PropTurret:getBulletCount()
+        return self._bulletCount or self.class.BULLET_COUNT
+    end
+
+    function PropTurret:setBulletSpread( spread )
+        if spread == nil then
+            self._bulletSpread = nil
+
+            return
+        end
+
+        if type( spread ) ~= "number" then error( "Expected spread to be a number or nil" ) end
+        if spread < 0 or spread > 1 then error( "spread must be between 0 and 1" ) end
+
+        self._bulletSpread = spread
+    end
+
+    function PropTurret:getBulletSpread()
+        return self._bulletSpread or self.class.BULLET_SPREAD
+    end
+
+    function PropTurret:setBulletColor( color )
+        if color == nil then
+            self._bulletColor = nil
+
+            return
+        end
+
+        if type( color ) ~= "Color" then error( "Expected color to be a Color or nil" ) end
+
+        self._bulletColor = color
+    end
+
+    function PropTurret:getBulletColor()
+        return self._bulletColor or self.class.BULLET_COLOR
+    end
+
+    function PropTurret:setBulletLinger( duration )
+        if duration == nil then
+            self._bulletLinger = nil
+
+            return
+        end
+
+        if type( duration ) ~= "number" then error( "Expected duration to be a number or nil" ) end
+        if duration <= 0 then error( "duration must be > 0" ) end
+
+        self._bulletLinger = duration
+    end
+
+    function PropTurret:getBulletLinger()
+        return self._bulletLinger or self.class.BULLET_LINGER
+    end
+
+    function PropTurret:setBulletMaterial( material )
+        if material == nil then
+            self._bulletMaterial = nil
+
+            return
+        end
+
+        if type( material ) ~= "string" then error( "Expected material to be a string or nil" ) end
+
+        self._bulletMaterial = material
+    end
+
+    function PropTurret:getBulletMaterial()
+        return self._bulletMaterial or self.class.BULLET_MATERIAL
+    end
+
+    function PropTurret:getBulletModel()
+        return self.class.BULLET_MODEL
+    end
+
+    function PropTurret:setShootCooldown( duration )
+        if duration == nil then
+            self._shootCooldown = nil
+
+            return
+        end
+
+        if type( duration ) ~= "number" then error( "Expected duration to be a number or nil" ) end
+        if duration < 0 then error( "duration must be >= 0" ) end
+
+        self._shootCooldown = duration
+    end
+
+    function PropTurret:setTargetVelAccount( multiplier )
+        if multiplier == nil then
+            self._targetVelAccount = nil
+
+            return
+        end
+
+        if type( multiplier ) ~= "number" then error( "Expected multiplier to be a number or nil" ) end
+
+        self._targetVelAccount = multiplier
+    end
+
+    function PropTurret:getTargetVelAccount()
+        return self._targetVelAccount or self.class.TARGET_VEL_ACCOUNT
+    end
+
+    function PropTurret:getShootCooldown()
+        return self._shootCooldown or self.class.SHOOT_COOLDOWN
+    end
+
+    function PropTurret:isOnShotCooldown()
+        return self._isOnShotCooldown
+    end
+end
+
+
+----- OVERRIDABLE FUNCTIONS -----
+
+-- Called every tick.
+function PropTurret:think()
+
+end
+
+--[[
+    - Callback for when the PropTurret is destroyed.
+    - Used for cleaning up props, holograms, etc.
+    - Can safely be made different between server and client.
+--]]
+function PropTurret:onDestroyed()
+
+end
+
+--[[
+    - Callback for when the auto target of the PropTurret is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+--]]
+function PropTurret:onAutoTargetChanged()
+
+end
+
+--[[
+    - Callback for when the target of the PropTurret is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevTarget will always be nil on the first call.
+--]]
+function PropTurret:onSetTarget( _prevTarget )
+
+end
+
+--[[
+    - Callback for when the effective position and/or angles of the PropTurret has changed for any reason.
+    - Caused by :setPos(), :setAngles(), :setParent(), or the parent Entity moving.
+    -- Can safely be made different between server and client.
+--]]
+function PropTurret:onPosAngChanged( _prevPos, _prevAng )
+
+end
+
+--[[
+    - Callback for when the position of the PropTurret is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevPos will always be nil on the first call.
+--]]
+function PropTurret:onSetPos( _prevPos )
+
+end
+
+--[[
+    - Callback for when the angles of the PropTurret are changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevAng will always be nil on the first call.
+--]]
+function PropTurret:onSetAngles( _prevAng )
+
+end
+
+--[[
+    - Callback for when the parent of the PropTurret is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+--]]
+function PropTurret:onSetParent( _prevParent )
+
+end
+
+--[[
+    - Callback for when the head angles of the PropTurret are changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevHeadPos will always be nil on the first call.
+--]]
+function PropTurret:onSetHeadPos( _prevHeadPos )
+
+end
+
+--[[
+    - Callback for when the head angles of the PropTurret are changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevHeadAng will always be nil on the first call.
+--]]
+function PropTurret:onSetHeadAngles( _prevHeadAng )
+
+end
+
+--[[
+    - Callback for when the shoot position of the PropTurret is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevShootPos will always be nil on the first call.
+--]]
+function PropTurret:onSetShootPos( _prevShootPos )
+
+end
+
+--[[
+    - Callback for when the PropTurret shoots.
+    - Used for updating props, holograms, playing sounds, etc.
+    - Can safely be made different between server and client.
+
+    bullets: A table of bullet props that were shot.
+--]]
+function PropTurret:onShoot( _bullets )
+
+end
+
+-- Return the position that the PropTurret should aim at for the given target. Do not account for target velocity here.
+function PropTurret:getAimPosForTarget( target )
+    return target:obbCenterW()
+end
+
+-- Filter for auto targetting.
+function PropTurret:targetFilter( ent )
+    if not isValid( ent ) then return false end
+
+    if self:doesTargetNPCs() then
+        if not ent.isNPC or not ent:isNPC() then return false end
+        if ent:getNoDraw() then return false end
+
+        return true
+    end
+
+    if not ent.isPlayer or not ent:isPlayer() then return false end
+    if not ent:isAlive() then return false end
+    if glist.filterPlayer( ent ) then return false end -- Ignore players in the whitelist.
+    if pvp and not pvp.playerIsInPvp( ent ) then return false end
+    if ent:getColor().a ~= 255 then return false end -- Ignore cloaked and (on CFC) spawn-protected players.
+
+    local vehiclePref = self:getVehicleTargetMode()
+    local isInVehicle = ent:inVehicle()
+    if vehiclePref == 0 and isInVehicle then return false end
+    if vehiclePref == 1 and not isInVehicle then return false end
+
+    return true
+end
+
+--[[
+    - Return a sequential table of additional entities which should not block line of sight.
+    - Bullets and registered props are already filtered out.
+--]]
+function PropTurret:getExtraTraceFilterEnts()
+    return {}
+end
+
+if SERVER then
+    --[[
+        - For each bullet that gets shot, this is called the first time it collides with something.
+        - If the bullet is an explosive prop going at high speed, it will likely explode first and not reach this callback.
+    --]]
+    function PropTurret:onBulletImpact( _bullet, _colData )
+
+    end
+
+    --[[
+        - For each bullet that gets shot, this is called when it's stored (despawned).
+        - This is called after the bullet has been removed from the active list.
+    --]]
+    function PropTurret:onStoreBullet( _bullet )
+
+    end
+
+    --[[
+        - Returns whether or not the PropTurret can shoot.
+        - If you override this function in subclasses, it's recommended to put the following at the top of your version:
+            if not ClassNameGoesHere.super.canShoot( self ) then return false end
+    --]]
+    function PropTurret:canShoot()
+        if self:isOnShotCooldown() then return false end
+        if propBuffer.getReadyCount( self:getBulletModel() ) < self:getBulletCount() then return false end
+
+        return true
+    end
+
+    -- This should return the Entity that the PropTurret should auto-target, or nil if it shouldn't target anything.
+    function PropTurret:handleAutoTarget()
+        local targets = self:getTargetsInCone()
+
+        for _, target in ipairs( targets ) do
+            if self:canSee( target ) then
+                return target
+            end
+        end
+    end
+end
+
+
+----- IMPLEMENTED FUNCTIONS -----
+
+if SERVER then
+    function PropTurret:onDestroyed()
+        table.removeByValue( allTurrets, self )
+        table.removeByValue( turretsByClass[self.class], self )
+        timer.remove( self:getTimerName( "LKL_PropTurret_CooldownFinished" ) )
+
+        PropTurret.super.onDestroyed( self )
+    end
+
+    function PropTurret:writeCreationData( pos, ang, headPos, headAng )
+        net.writeVector( pos )
+        net.writeAngle( ang )
+        net.writeVector( headPos )
+        net.writeAngle( headAng )
+    end
+else
+    function PropTurret:onDestroyed()
+        table.removeByValue( allTurrets, self )
+
+        PropTurret.super.onDestroyed( self )
+    end
+
+    function PropTurret.static:readCreationData()
+        return {
+            net.readVector(),
+            net.readAngle(),
+            net.readVector(),
+            net.readAngle(),
+        }
+    end
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+if SERVER then
+    registerTurretClass = function( classObj )
+        turretClassLookup[classObj] = true
+        table.insert( turretClasses, classObj )
+        turretsByClass[classObj] = {}
+
+        timer.create( "LKL_PropTurret_AutoTargetThink_" .. classObj.name, classObj.AUTO_TARGET_INTERVAL, 0, function()
+            if not startupSyncComplete then return end
+
+            for _, turret in ipairs( turretsByClass[classObj] ) do
+                if turret:doesAutoTarget() then
+                    turret:setTarget( turret:handleAutoTarget() )
+                end
+            end
+        end )
+    end
+
+    getRootParent = function( ent )
+        local parent = ent:getParent()
+        if not isValid( parent ) then return ent end
+
+        return getRootParent( parent )
+    end
+
+    function PropTurret:_getShootDir()
+        local target = self:getTarget()
+        local velAccount = self:getTargetVelAccount()
+
+        if isValid( target ) then
+            local shootPos = self:getShootWorldPos()
+            local targetPos = self:getAimPosForTarget( target )
+
+            if velAccount ~= 0 then
+                local targetVel = target:getVelocity()
+
+                if target.inVehicle and target:inVehicle() then
+                    targetVel = getRootParent( target:getVehicle() ):getVelocity()
+                end
+
+                local dist = shootPos:getDistance( targetPos )
+                targetPos = targetPos + targetVel * velAccount * dist / self:getBulletSpeed()
+            end
+
+            return ( targetPos - shootPos ):getNormalized()
+        end
+
+        local headAng = self:getHeadWorldAngles()
+
+        return headAng:getForward()
+    end
+
+    function PropTurret:_spreadDir( dir )
+        local spread = self:getBulletSpread()
+        if spread == 0 then return dir end
+
+        return vectorMath.spreadVector( dir, spread * 180 )
+    end
+end
+
+
+----- SETUP -----
+
+hook.add( "LKL_GList_StartupSync_Complete", "LKL_PropTurret_StartThinking", function()
+    -- Don't allow PropTurrets to think or auto-target until glist is ready.
+    startupSyncComplete = true
+end )
+
+hook.add( "think", "LKL_PropTurret_AutoShoot", function()
+    if not startupSyncComplete then return end
+
+    for _, turret in ipairs( PropTurret:getAll() ) do
+        if turret:doesAutoShoot() and isValid( turret:getTarget() ) then
+            turret:shoot()
+        end
+    end
+end )
+
+if SERVER then
+    hook.add( "LKL_PropBuffer_PropCreated", "LKL_PropTurret_NocollideBullets", function( ent )
+        local model = ent:getModel()
+        if not bulletModelLookup[model] then return end
+
+        local bullets = propBuffer.getProps( model )
+        local dontReduceConstraints = not PropTurret.REDUCE_CONSTRAINTS
+
+        if dontReduceConstraints then
+            for _, otherEnt in ipairs( bullets ) do
+                if otherEnt ~= ent then
+                    constraint.nocollide( ent, otherEnt )
+                end
+            end
+        end
+
+        for _, turret in ipairs( PropTurret:getAll() ) do
+            if turret:getBulletModel() == model then
+                for _, prop in ipairs( turret:getProps() ) do
+                    if dontReduceConstraints or not bulletPassableCollisionGroups[prop:getCollisionGroup()] then
+                        constraint.nocollide( ent, prop )
+                    end
+                end
+            end
+        end
+    end )
+else
+    net.receive( "LKL_Syncable_Set__PropTurret_AutoTarget", function()
+        local turret = Syncable:readSyncedCopy()
+        local state = net.readBool()
+
+        if not turret then return end
+
+        turret:setAutoTarget( state )
+    end )
+
+    net.receive( "LKL_Syncable_Set__PropTurret_Target", function()
+        local turret = Syncable:readSyncedCopy()
+        local target = net.readEntity()
+
+        if not turret then return end
+
+        if target == game.getWorld() then
+            turret:setTarget()
+        else
+            turret:setTarget( target )
+        end
+    end )
+
+    net.receive( "LKL_Syncable_Set__PropTurret_HeadPos", function()
+        local turret = Syncable:readSyncedCopy()
+        local pos = net.readVector()
+
+        if not turret then return end
+
+        turret:setHeadPos( pos )
+    end )
+
+    net.receive( "LKL_Syncable_Set__PropTurret_HeadAngles", function()
+        local turret = Syncable:readSyncedCopy()
+        local ang = net.readAngle()
+
+        if not turret then return end
+
+        turret:setHeadAngles( ang )
+    end )
+
+    net.receive( "LKL_Syncable_Set__PropTurret_ShootPos", function()
+        local turret = Syncable:readSyncedCopy()
+        local pos = net.readVector()
+
+        if not turret then return end
+
+        turret:setShootPos( pos )
+    end )
+
+    net.receive( "LKL_Syncable_Set__PropTurret_AutoTarget", function()
+        local turret = Syncable:readSyncedCopy()
+        local state = net.readBool()
+
+        if not turret then return end
+
+        turret:setAutoTarget( state )
+    end )
+
+
+    net.receive( "LKL_PropTurret_Shoot", function()
+        local turret = Syncable:readSyncedCopy()
+        local bullets = net.readTable()
+
+        if not turret then return end
+
+        turret:onShoot( bullets )
+    end )
+end
+

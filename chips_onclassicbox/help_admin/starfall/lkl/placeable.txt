@@ -1,0 +1,509 @@
+--@name Placeable
+--@author legokidlogan
+--@shared
+--@include lkl/syncable.txt
+
+--[[
+    - TODO
+--]]
+
+if Placeable then return end
+
+require( "lkl/syncable.txt" )
+
+
+Placeable = class( "Placeable", Syncable )
+
+-- These static vars can be overridden by subclasses, but not by instances.
+Placeable.static.THINK_PERF_LIMIT = 0.8 -- :think() calls will be skipped when the chip's fractional quota exceeds this amount.
+
+
+local ENTITY_TYPES = {
+    Entity = true,
+    Player = true,
+    Hologram = true,
+    Vehicle = true,
+    Npc = true,
+    NextBot = true,
+    Weapon = true,
+    PhysObj = true,
+    Effect = true,
+}
+
+local allPlaceables = {}
+local checkForPosAngChanges
+
+
+----- STATIC FUNCTIONS -----
+
+function Placeable:initialize( replicateOnClient, pos, ang, ... )
+    Placeable.super.initialize( self, replicateOnClient, pos, ang, ... )
+
+    table.insert( allPlaceables, self )
+
+    self._lastThinkTime = timer.curtime()
+    self._thinkDelta = 0
+
+    self:setPos( pos )
+    self:setAngles( ang )
+end
+
+function Placeable.static:getAll()
+    return allPlaceables
+end
+
+
+----- INSTANCE FUNCTIONS -----
+
+function Placeable:localToWorld( pos )
+    if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+    local worldPos = localToWorld( pos, Angle(), self:getPos(), self:getAngles() )
+
+    return worldPos
+end
+
+function Placeable:localToWorldAngles( ang )
+    if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+    local _, localAng = localToWorld( Vector(), ang, Vector(), self:getAngles() )
+
+    return localAng
+end
+
+function Placeable:localToWorldPosAng( pos, ang )
+    if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+    if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+    return localToWorld( pos, ang, self:getPos(), self:getAngles() )
+end
+
+function Placeable:worldToLocal( pos )
+    if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+    local localPos = worldToLocal( pos, Angle(), self:getPos(), self:getAngles() )
+
+    return localPos
+end
+
+function Placeable:worldToLocalAngles( ang )
+    if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+    local _, localAng = worldToLocal( Vector(), ang, Vector(), self:getAngles() )
+
+    return localAng
+end
+
+function Placeable:worldToLocalPosAng( pos, ang )
+    if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+    if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+    return worldToLocal( pos, ang, self:getPos(), self:getAngles() )
+end
+
+-- Sets the position of the Placeable.
+function Placeable:setPos( pos )
+    if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+    local prevPos = self:getPos()
+    if prevPos == pos then return end
+
+    local parent = self:getParent()
+
+    if isValid( parent ) then
+        self._localPos = parent:worldToLocal( pos )
+    end
+
+    self._pos = pos
+    self:syncProperty( "Placeable_Pos", pos )
+    self:onSetPos( prevPos )
+    self:onPosAngChanged( prevPos, self:getAngles() )
+end
+
+function Placeable:getPos()
+    local parent = self:getParent()
+    if isValid( parent ) then return parent:localToWorld( self._localPos ) end
+
+    return self._pos
+end
+
+function Placeable:getLocalPos()
+    if not isValid( self:getParent() ) then return self._pos end
+
+    return self._localPos
+end
+
+-- Sets the angles of the Placeable.
+function Placeable:setAngles( ang )
+    if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+    local prevAng = self:getAngles()
+    if prevAng == ang then return end
+
+    local parent = self:getParent()
+
+    if isValid( parent ) then
+        self._localAng = parent:worldToLocalAngles( ang )
+    end
+
+    self._ang = ang
+    self:syncProperty( "Placeable_Angles", ang )
+    self:onSetAngles( prevAng )
+    self:onPosAngChanged( self:getPos(), prevAng )
+end
+
+function Placeable:getAngles()
+    local parent = self:getParent()
+    if isValid( parent ) then return parent:localToWorldAngles( self._localAng ) end
+
+    return self._ang
+end
+
+function Placeable:getLocalAngles()
+    if not isValid( self:getParent() ) then return self._ang end
+
+    return self._localAng
+end
+
+--[[
+    - Sets/unsets the parent of the Placeable.
+    - To track changes in the Placeable's effective location due to the parent moving, see :onPosAngChanged().
+--]]
+function Placeable:setParent( ent )
+    if ent ~= nil and not isValid( ent ) then error( "Expected ent to be valid or nil" ) end
+
+    local entType = type( ent )
+    local isPlaceable = false
+
+    if ent ~= nil and not ENTITY_TYPES[entType] then
+        if entType ~= "table" or not ent.isInstanceOf or not ent:isInstanceOf( Placeable ) then error( "Expected ent to be an Entity, nil, or a subclass of Placeable" ) end
+
+        isPlaceable = true
+    end
+
+    local prevParent = self:getParent()
+    if prevParent == ent then return end
+
+    local worldPos = self:getPos()
+    local worldAng = self:getAngles()
+    local localPos = ent and ent:worldToLocal( worldPos )
+    local localAng = ent and ent:worldToLocalAngles( worldAng )
+
+    self._parent = ent
+    self._localPos = localPos
+    self._localAng = localAng
+    self._parentPrevPos = ent and ent:getPos()
+    self._parentPrevAng = ent and ent:getAngles()
+
+    if ent == nil then
+        self._pos = worldPos
+        self._ang = worldAng
+
+        if isValid( prevParent ) then
+            table.removeByValue( prevParent._placeable_Children or {}, self )
+        end
+    else
+        local children = ent._placeable_Children
+
+        if not children then
+            children = {}
+            ent._placeable_Children = children
+        end
+
+        table.insert( children, self )
+    end
+
+    if SERVER then
+        self:syncProperty( "Placeable_Parent", {
+            ent = isPlaceable and ent:getID() or ent,
+            localPos = localPos or Vector(),
+            localAng = localAng or Angle(),
+        } )
+    end
+
+    self:onSetParent( prevParent )
+    self:onPosAngChanged( worldPos, worldAng )
+end
+
+function Placeable:getParent()
+    return self._parent
+end
+
+-- Returns by reference, do not modify.
+function Placeable:getChildren()
+    local children = self._placeable_Children
+
+    if not children then
+        children = {}
+        self._placeable_Children = children
+    end
+
+    return children
+end
+
+--[[
+    - Delays the next :think() until the given time is reached.
+    - Also delays the next pos/ang update check, which impacts parented Placeables.
+
+    time: (number)
+        - The curtime-based timestamp for when thinking should resume as normal.
+--]]
+function Placeable:setNextThinkTime( time )
+    if type( time ) ~= "number" then error( "Expected time to be a number" ) end
+
+    self._nextThinkTime = time
+end
+
+-- Same as :setNextThinkTime(), but as an amount of seconds from now, instead of a timestamp.
+function Placeable:setNextThinkTimeFromNow( delay )
+    self._nextThinkTime = timer.curtime() + delay
+end
+
+-- Will be nil if the next think is not delayed.
+function Placeable:getNextThinkTime()
+    return self._nextThinkTime
+end
+
+-- Acts similarly to timer.frametime(), but accounts for any time the Placeable's :think() gets skipped due to cpu usage.
+function Placeable:getThinkDelta()
+    return self._thinkDelta
+end
+
+
+----- OVERRIDABLE FUNCTIONS -----
+
+-- Called every tick.
+function Placeable:think()
+
+end
+
+--[[
+    - Callback for when the Placeable is destroyed.
+    - Used for cleaning up props, holograms, etc.
+    - Can safely be made different between server and client.
+--]]
+function Placeable:onDestroyed()
+
+end
+
+--[[
+    - Callback for when the effective position and/or angles of the Placeable has changed for any reason.
+    - Caused by :setPos(), :setAngles(), :setParent(), or the parent Entity moving.
+    -- Can safely be made different between server and client.
+--]]
+function Placeable:onPosAngChanged( _prevPos, _prevAng )
+
+end
+
+--[[
+    - Callback for when the position of the Placeable is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevPos will always be nil on the first call.
+--]]
+function Placeable:onSetPos( _prevPos )
+
+end
+
+--[[
+    - Callback for when the angles of the Placeable are changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+    - Note that prevAng will always be nil on the first call.
+--]]
+function Placeable:onSetAngles( _prevAng )
+
+end
+
+--[[
+    - Callback for when the parent of the Placeable is changed.
+    - Used for updating props, holograms, etc.
+    - Can safely be made different between server and client.
+--]]
+function Placeable:onSetParent( _prevParent )
+
+end
+
+
+if SERVER then
+    -- Called when a synced serverside Placeable fails to replicate to a client.
+    function Placeable:onReplicationFailed( _ply, _err )
+
+    end
+end
+
+
+----- IMPLEMENTED FUNCTIONS -----
+
+function Placeable:tostringInner()
+    return "ID " .. self:getID()
+end
+
+function Placeable:onDestroyed()
+    table.removeByValue( allPlaceables, self )
+
+    local parent = self:getParent()
+
+    if isValid( parent ) then
+        table.removeByValue( parent._placeable_Children or {}, self )
+    end
+
+    local children = self._placeable_Children
+
+    if children then
+        for _, placeable in ipairs( children ) do
+            if isValid( placeable ) and not placeable:isSyncedCopy() then
+                placeable:destroy()
+            end
+        end
+    end
+
+    Placeable.super.onDestroyed( self )
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+checkForPosAngChanges = function( placeable )
+    local parent = placeable:getParent()
+    if not isValid( parent ) then return end
+
+    local parentPrevPos = placeable._parentPrevPos
+    local parentPrevAng = placeable._parentPrevAng
+    local parentPos = parent:getPos()
+    local parentAng = parent:getAngles()
+    if parentPrevPos == parentPos and parentPrevAng == parentAng then return end
+
+    local prevPos, prevAng = localToWorld( placeable:getLocalPos(), placeable:getLocalAngles(), parentPrevPos, parentPrevAng )
+
+    placeable._parentPrevPos = parentPos
+    placeable._parentPrevAng = parentAng
+    placeable:onPosAngChanged( prevPos, prevAng )
+end
+
+
+----- SETUP -----
+
+hook.add( "think", "LKL_Placeable_Think", function()
+    local perfTotalLimit = cpuMax()
+    local totalPerf = cpuTotalAverage()
+    if totalPerf >= perfTotalLimit then return end
+
+    local otherPerf = totalPerf - cpuAverage() -- cpu usage from owner's other chips
+    local skippedClasses = {}
+    local now = timer.curtime()
+
+    for _, placeable in ipairs( allPlaceables ) do
+        local classObj = placeable.class
+        if skippedClasses[classObj] then continue end
+
+        -- Check perf limit. Each class could have a different limit, so unfortunately this gets a bit ugly.
+        local perfLimitFrac = placeable.class.THINK_PERF_LIMIT
+
+        if cpuAverage() > perfTotalLimit * perfLimitFrac - otherPerf then
+            skippedClasses[classObj] = true -- Ignore this class for the rest of the tick.
+
+            continue
+        end
+
+        -- Handle next think time.
+        local nextThinkTime = placeable:getNextThinkTime()
+
+        if nextThinkTime then
+            if now < nextThinkTime then continue end
+
+            placeable._nextThinkTime = nil
+        end
+
+        local dt = now - placeable._lastThinkTime
+        placeable._lastThinkTime = now
+        placeable._thinkDelta = dt
+
+        checkForPosAngChanges( placeable )
+        placeable:think()
+    end
+end )
+
+hook.add( "EntityRemoved", "LKL_Placeable_DestroyChildren", function( ent )
+    if not ent then return end -- Can sometimes be nil somehow
+
+    local children = ent._placeable_Children
+    if not children then return end
+
+    ent._placeable_Children = nil
+
+    for _, placeable in ipairs( children ) do
+        if isValid( placeable ) and not placeable:isSyncedCopy() then
+            placeable:destroy()
+        end
+    end
+end )
+
+
+if SERVER then
+    function Placeable:writeCreationData( pos, ang )
+        net.writeVector( pos )
+        net.writeAngle( ang )
+    end
+
+    return
+end
+
+
+function Placeable.static:readCreationData()
+    return {
+        net.readVector(),
+        net.readAngle(),
+    }
+end
+
+
+net.receive( "LKL_Syncable_Set__Placeable_Pos", function()
+    local placeable = Syncable:readSyncedCopy()
+    local pos = net.readVector()
+
+    if not placeable then return end
+
+    placeable:setPos( pos )
+end )
+
+net.receive( "LKL_Syncable_Set__Placeable_Angles", function()
+    local placeable = Syncable:readSyncedCopy()
+    local ang = net.readAngle()
+
+    if not placeable then return end
+
+    placeable:setAngles( ang )
+end )
+
+net.receive( "LKL_Syncable_Set__Placeable_Parent", function()
+    local placeable = Syncable:readSyncedCopy()
+    local data = net.readTable()
+
+    if not placeable then return end
+
+    local parent = data.ent
+
+    if type( parent ) == "number" then
+        parent = Syncable:getByID( -parent )
+
+        if not parent then error( "The serverside parent (id " .. parent .. " ) in " .. tostring( placeable ) .. ":setParent( parent ) is not synced clientside" ) end
+    else
+        parent = isValid( parent ) and parent or nil
+    end
+
+    if not parent then
+        placeable:setParent( nil )
+
+        return
+    end
+
+    local localPos = data.localPos
+    local localAng = data.localAng
+
+    placeable._parent = nil
+    placeable._pos = localPos
+    placeable._ang = localAng
+
+    placeable:setParent( parent )
+end )

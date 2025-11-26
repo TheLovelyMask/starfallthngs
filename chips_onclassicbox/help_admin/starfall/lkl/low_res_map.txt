@@ -1,0 +1,66 @@
+--@name Low Res Map
+--@author
+--@shared
+--@ owneronly
+--@include lkl/map_mesh.txt
+
+-- Overlays a simplified map mesh onto the map itself.
+
+-- CONFIG
+local faceExtend = 1
+local requireHUD = true
+-- END CONFIG
+
+
+libMapMesh = libMapMesh or {}
+libMapMesh.MESH_SCALE_OVERRIDE = 1
+libMapMesh.MESH_OFFSET_OVERRIDE = Vector()
+
+require( "lkl/map_mesh.txt" )
+
+
+function libMapMesh.nudgeSurfaceVerts( surfaceVerts, surfaceNormal, _surfaceInd )
+    local surfaceCount = #surfaceVerts
+    local surfaceCenter = vectorMath.getCenter( surfaceVerts )
+    local prevEdgeOffset = vectorMath.getDirectionAndLength(
+        ( surfaceVerts[1] + surfaceVerts[surfaceCount] ) / 2 - surfaceCenter
+    )
+
+    for i = 1, surfaceCount do
+        local vert = surfaceVerts[i]
+        local nextVert = surfaceVerts[i + 1] or surfaceVerts[1]
+        local nextEdgeOffset = vectorMath.getDirectionAndLength(
+            ( vert + nextVert ) / 2 - surfaceCenter
+        )
+
+        surfaceVerts[i] = vert + ( surfaceNormal + prevEdgeOffset + nextEdgeOffset ) * faceExtend
+        prevEdgeOffset = nextEdgeOffset
+    end
+end
+
+
+if SERVER then return end
+
+
+local function setNoDraw( holos, state )
+    for _, holo in ipairs( holos ) do
+        holo:setNoDraw( state )
+    end
+end
+
+
+hook.add( "LKL_MapMesh_MeshesReady", "LKL_LowResMap_CreateHolos", function()
+    local mapHoloBase, mapHolos = libMapMesh.createMeshHolos( Vector(), Angle(), nil )
+
+    if requireHUD then
+        setNoDraw( mapHolos, not render.isHUDActive() )
+
+        hook.add( "hudconnected", "LKL_LowResMap_SetVisibility", function()
+            setNoDraw( mapHolos, false )
+        end )
+
+        hook.add( "huddisconnected", "LKL_LowResMap_SetVisibility", function()
+            setNoDraw( mapHolos, true )
+        end )
+    end
+end )

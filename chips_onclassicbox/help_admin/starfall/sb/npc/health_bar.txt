@@ -1,0 +1,354 @@
+--@name Health Bar
+--@author shroobloom
+--@shared
+--@include sb/rt_sprite.txt
+--@include sb/entity_networker.txt
+
+
+
+
+local RTSprite = require("sb/rt_sprite.txt")
+local EntityNetworker = require("sb/entity_networker.txt")
+
+local HealthBar = class("HealthBar", RTSprite)
+HealthBar.BOSS_HEIGHT = 58
+HealthBar.HEIGHT = 32
+HealthBar.Instances = {}
+
+local CORNER_ROUNDING = 8
+
+if CLIENT then
+    HealthBar.HealthFont = render.createFont("Coolvetica", 48, 700)
+end
+
+
+
+
+function HealthBar:initialize( Subject, Name, Boss )
+    assert(not HealthBar.Instances[Subject], "Health bar already exists for " .. tostring(Subject) .. "!")
+    
+    if CLIENT then
+        RTSprite.initialize( self )
+        self:setParent( Subject )
+        self.Offset = Vector(0,0,Subject:obbSize().z/2 + 100)
+        self.RenderPriority = Boss and 100 or 1
+    end
+    
+    if Boss == nil then
+        Boss = true
+    end
+    
+    self.Subject = Subject
+    self.Name = Name
+    
+    self.DecayLevel = 0
+    
+    self.LastPercent = 1
+    
+    self.Health = 100
+    self.MaxHealth = 100
+    
+    self.Color = Color(255,0,0)
+    self.DecayColor = Color(255,156,3)
+    
+    self.LastDamage = timer.curtime()
+    self.Boss = Boss
+    
+    self:setScale( Subject:obbSize():getLength() * 0.025 )
+    
+    if SERVER then
+        EntityNetworker:add( Subject, function( plr )
+            net.start("healthBar_create")
+            net.writeString(self.Name)
+            net.writeFloat(self.Health)
+            net.writeFloat(self.MaxHealth)
+            net.writeColor(self.Color)
+            net.writeColor(self.DecayColor)
+            net.writeBool(self.Boss)
+            net.writeEntity(self.Subject)
+            net.send( plr )
+        end)
+    end
+    
+    HealthBar.Instances[Subject] = self
+end
+
+
+if CLIENT then
+    net.receive("healthBar_create", function()
+        local name = net.readString()
+        local health = net.readFloat()
+        local maxHealth = net.readFloat()
+        local col = net.readColor()
+        local decay = net.readColor()
+        local isBoss = net.readBool()
+        
+        net.readEntity(function(subject)
+            local created = HealthBar:new( subject, name )
+            created:setHealth( health )
+            created:setMaxHealth( maxHealth )
+            created:setColor( col )
+            created:setDecayColor( decay )
+            created.Boss = isBoss
+        end)
+    end)
+end
+
+
+
+function HealthBar:isValid()
+    return isValid(self.Subject) and HealthBar.Instances[self.Subject] == self
+end
+
+
+
+
+function HealthBar:setColor( col )
+    self.Color = col
+    
+    if SERVER and self:isValid() then
+        net.start("healthBar_setColor")
+        net.writeColor( col )
+        net.writeEntity( self.Subject )
+        net.send( target )
+    end
+end
+
+if CLIENT then
+    net.receive("healthBar_setColor", function()
+        local col = net.readColor()
+        
+        net.readEntity(function(subject)
+            if not HealthBar.Instances[subject] then return end
+            HealthBar.Instances[subject]:setColor( col )
+        end)
+    end)
+end
+
+
+function HealthBar:setDecayColor( decayCol )
+    self.DecayColor = decayCol
+    
+    if SERVER and self:isValid() then
+        net.start("healthBar_setDecayColor")
+        net.writeColor( decayCol )
+        net.writeEntity( self.Subject )
+        net.send()
+    end
+end
+
+if CLIENT then
+    net.receive("healthBar_setDecayColor", function()
+        local col = net.readColor()
+        
+        net.readEntity(function(subject)
+            if not HealthBar.Instances[subject] then return end
+            HealthBar.Instances[subject]:setDecayColor( col )
+        end)
+    end)
+end
+
+
+
+
+
+function HealthBar:setHealth( health )
+    self.Health = health
+    
+    if SERVER and self:isValid() then
+        net.start("healthBar_setHealth")
+        net.writeFloat( health )
+        net.writeEntity( self.Subject )
+        net.send()
+    end
+end
+
+if CLIENT then
+    net.receive("healthBar_setHealth", function()
+        local health = net.readFloat()
+        
+        net.readEntity(function(subject)
+            if not HealthBar.Instances[subject] then return end
+            HealthBar.Instances[subject]:setHealth( health )
+        end)
+    end)
+end
+
+
+
+
+function HealthBar:setMaxHealth( maxHealth )
+    self.MaxHealth = maxHealth
+    
+    if SERVER and self:isValid() then
+        net.start("healthBar_setMaxHealth")
+        net.writeFloat( maxHealth )
+        net.writeEntity( self.Subject )
+        net.send()
+    end
+end
+
+if CLIENT then
+    net.receive("healthBar_setMaxHealth", function()
+        local maxHealth = net.readFloat()
+        
+        net.readEntity(function(subject)
+            if not HealthBar.Instances[subject] then return end
+            HealthBar.Instances[subject]:setMaxHealth( maxHealth )
+        end)
+    end)
+end
+
+
+
+--TODO: network?
+function HealthBar:remove()
+    HealthBar.Instances[self.Subject] = nil
+    
+    if CLIENT then
+        RTSprite.remove( self )
+    end
+    
+    if SERVER then
+        EntityNetworker:remove( self.Subject )
+    end
+end
+
+
+
+
+function HealthBar:getHealth()
+    if self.Subject:isNPC() then
+        return self.Subject:getHealth()
+    end
+    
+    return self.Health
+end
+
+function HealthBar:getMaxHealth()
+    if self.Subject:isNPC() then
+        return self.Subject:getMaxHealth()
+    end
+    
+    return self.MaxHealth
+end
+
+
+function HealthBar:getFillPercentage()
+    if not isValid(self.Subject) then return 0 end
+    
+    return math.clamp(self:getHealth() / self:getMaxHealth(), 0, 1)
+end
+
+
+
+
+function HealthBar:render()
+    if not isValid(self.Subject) then return end
+    
+    local pc = self:getFillPercentage()
+    
+    if pc ~= self.LastPercent then
+        local hpDiff = (self.LastPercent - pc) * self:getMaxHealth()
+        
+        if hpDiff > 1 then --mostly to avoid burning from preventing decay
+            self.LastDamage = timer.curtime()
+        end
+        
+        self.LastPercent = pc
+    end
+    
+    -- this shouldnt happen, but just in case it heals or something
+    if self.DecayLevel < pc then
+        self.DecayLevel = pc
+    end
+    
+    local height = self.Boss and HealthBar.BOSS_HEIGHT or HealthBar.HEIGHT
+    
+    render.clear(Color(0,0,0,0))
+    
+    render.setColor(Color(255,255,255))
+    render.setFont(HealthBar.HealthFont)
+    render.drawSimpleText( 512, 512 - height - 32, self.Name:upper(), 1 )
+    
+    render.setColor(Color(20,20,20,128))
+    render.drawRoundedBox( CORNER_ROUNDING, 0, 512 - height/2, 1024, height)
+    
+    if pc ~= self.DecayLevel or pc == 0 then
+        render.setColor(self.DecayColor)
+        render.drawRoundedBox( CORNER_ROUNDING, 8, 512 - height/2 + 8, (1024 - 16) * self.DecayLevel, height - 16)
+        
+        local shake = pc == 0 and 1 or math.clamp((self.DecayLevel - pc)*18, 0, 1)
+        
+        self:setPos(Vector(math.random()-0.5, math.random()-0.5, math.random()-0.5) * 12 * shake)
+        
+        if timer.curtime() - self.LastDamage > 0.25 then
+            self.DecayLevel = math.lerp(0.035, self.DecayLevel, pc)
+            
+            if math.abs(self.DecayLevel - pc) < 0.0001 then
+                self.DecayLevel = pc
+            end
+        end
+    end
+    
+    render.setColor(self.Color)
+    render.drawRoundedBox( CORNER_ROUNDING, 8, 512 - height/2 + 8, (1024 - 16) * pc, height - 16)
+    
+end
+
+
+
+
+hook.add("EntityRemoved", "healthBar_removeOnInvalidSubject", function( e )
+    if not HealthBar.Instances[e] then return end
+    HealthBar.Instances[e]:remove()
+end)
+
+
+
+
+
+--[[
+chip().Health = 100
+chip().MaxHealth = 100
+
+local test = HealthBar:new( chip(), "Starfall, The Fallen" )
+test:setParent(chip())
+test:setPos(Vector(0,0,50))
+
+
+timer.simple(2, function()
+    chip().Health = 20
+end)
+]]
+
+
+-- test v2
+--[[if SERVER then
+    
+    timer.simple(4, function()
+        print("created it")
+        local test = prop.create(Vector(-1000,-1000,-11000), Angle(), "models/hunter/blocks/cube05x05x05.mdl", true)
+        
+        local bar = HealthBar:new( test, "asdf", true )
+        bar:setColor(Color(144,0,255))
+        bar:setDecayColor( Color(255,0,255) )
+        
+        timer.simple(4, function()
+            bar:setColor( Color(0,255,0) )
+            bar:setDecayColor(Color(255,0,0))
+        end)
+        
+        timer.create("asdf", 1, 0, function()
+            bar:setHealth( bar.Health - 10 * math.random() )
+        end)
+        
+        timer.simple(6, function()
+            test:remove()
+            timer.stop("asdf")
+        end)
+    end)
+end]]
+
+
+return HealthBar

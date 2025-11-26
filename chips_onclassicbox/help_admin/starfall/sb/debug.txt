@@ -1,0 +1,174 @@
+--@name Debug
+--@author shroobloom
+--@shared
+
+
+
+local Debug = {}
+Debug.Markers = {}
+Debug.LastPrints = {}
+
+
+function Debug.marker( id, pos, color )
+    if not Debug.Markers[id] then
+        local marker = hologram.create( pos or Vector(), ang or Angle(), model or "models/hunter/blocks/cube05x05x05.mdl", scale or Vector(1,1,1) )
+        marker:suppressEngineLighting( true )
+        marker:setColor(color or Color(255,255,255))
+        marker:setMaterial("models/debug/debugwhite")
+        
+        Debug.Markers[id] = marker
+    end
+    
+    if pos then
+        Debug.Markers[id]:setPos(pos)
+    end
+    
+    if ang then
+        Debug.Markers[id]:setAngles(ang)
+    end
+    
+    if model and Debug.Markers[id]:getModel() ~= model then
+        Debug.Markers[id]:setModel(model)
+    end
+    
+    if scale then
+        Debug.Markers[id]:setScale(scale)
+    end
+    
+    if color then
+        Debug.Markers[id]:setColor(color)
+    end
+    
+    return Debug.Markers[id]
+end
+
+
+function Debug.vector( id, pos, dir, color )
+    dir = dir:getNormalized()
+    
+    if not Debug.Markers[id] then
+        local marker = hologram.create( pos, dir:getAngle(), "models/sprops/misc/bone_from_x.mdl", Vector(1,1,1) )
+        marker:suppressEngineLighting( true )
+        marker:setMaterial("models/debug/debugwhite")
+        
+        Debug.Markers[id] = marker
+    else
+        Debug.Markers[id]:setPos( pos )
+        Debug.Markers[id]:setAngles( dir:getAngle() )
+    end
+    
+    if color then
+        Debug.Markers[id]:setColor( color )
+    end
+    
+    return Debug.Markers[id]
+end
+
+
+
+--TODO: fix
+function Debug.line( id, p0, p1, color )
+    if not Debug.Markers[id] then
+        Debug.marker( id, Vector(), Angle(), "models/sprops/cylinders/size_5/cylinder_12x12.mdl" )
+    end
+    
+    if color then
+        Debug.Markers[id]:setColor(color)
+    end
+    
+    Debug.Markers[id]:setPos((p0 + p1)/2)
+    Debug.Markers[id]:setAngles((p1-p0):getAngle() + Angle(90,0,0))
+    Debug.Markers[id]:setSize( Vector(3,3,p0:getDistance(p1)) )
+    
+end
+
+
+function Debug.clear()
+    for i,v in pairs(Debug.Markers) do
+        v:remove()
+        Debug.Markers[i] = nil
+    end
+end
+
+
+
+function Debug.periodicPrint( id, delay, ... )
+    if Debug.LastPrints[id] and timer.curtime() - Debug.LastPrints[id] < delay then return end
+    
+    Debug.LastPrints[id] = timer.curtime()
+    print(...)
+end
+
+function Debug.periodicPrintTable( id, delay, t )
+    if Debug.LastPrints[id] and timer.curtime() - Debug.LastPrints[id] < delay then return end
+    
+    Debug.LastPrints[id] = timer.curtime()
+    printTable(t)
+end
+
+
+
+
+
+local benchStart = 0
+local benchTimes = {}
+local curBenchmark = ""
+
+
+
+function Debug.startBenchmark( ... )
+    benchStart = timer.systime()
+    
+    local benches = {...}
+    
+    if #benches == 0 then
+        benches[1] = "unassigned"
+    end
+    
+    for i,v in pairs(benches) do
+        benchTimes[v] = 0
+    end
+    
+    curBenchmark = benches[1]
+end
+
+
+function Debug.setBenchmark( id )
+    --Note: systime is not reused here because it can change from line to line, meaning the perf cost of rawset and setting variables would be counted as well.
+    local st = timer.systime()
+    rawset(benchTimes, curBenchmark, st - benchStart)
+    
+    curBenchmark = id
+    benchStart = timer.systime()
+end
+
+
+function Debug.finishBenchmark()
+    Debug.setBenchmark("")
+    print("Benchmark finished, results:")
+    
+    for i,v in pairs(benchTimes) do
+        print(i .. ": \n- " .. string.format("%.7f", v))
+    end
+end
+
+
+--print(string.format("%.18f", math.pi))
+
+--[[
+if SERVER then
+Debug.startBenchmark("trace", "sqrt")
+
+for i=1, 1000 do
+    Debug.setBenchmark("trace")
+    local a = trace.line(chip():getPos(), chip():getPos() + Vector(0,0,100), chip())
+    Debug.setBenchmark("sqrt")
+    local b = math.sqrt(1 + 3)
+end
+
+Debug.finishBenchmark()
+end
+]]
+
+
+return Debug

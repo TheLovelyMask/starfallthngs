@@ -1,0 +1,82 @@
+--@name Sphere Inside Animation
+--@author
+--@shared
+--@include lkl/anims/screen_holo_animation.txt
+
+--[[
+    - Draws multiple materials on the screens of people whose eyes are inside a spherical hologram.
+    - Used for enhanced visual effects on the inside of an (outwardly) opqaue spherical animation.
+        - Works best in conjunction with a SphereAnimation.
+--]]
+
+
+if SphereInsideAnimation then return end
+
+require( "lkl/anims/screen_holo_animation.txt" )
+
+
+SphereInsideAnimation = class( "SphereInsideAnimation", ScreenHoloAnimation )
+local ThisClass = SphereInsideAnimation -- For readability
+
+
+----- STATIC FUNCTIONS -----
+
+function ThisClass:initialize( replicateOnClient, pos, ang, ... )
+    ThisClass.super.initialize( self, replicateOnClient, pos, ang, ... )
+end
+
+
+----- INSTANCE FUNCTIONS -----
+
+--[[
+    - The reference holo to use for determining whether or not a player's eyes are inside the animation.
+    - Must be a starfall hologram or nil.
+    - Should be a perfectly spherical model where its scale is equal across all axes.
+--]]
+function ThisClass:setReferenceHolo( holo )
+    if holo ~= nil and type( holo ) ~= "Hologram" then error( "Expected holo to be a Hologram or nil" ) end
+
+    self._referenceHolo = holo
+    self:syncProperty( "SphereInsideAnimation_ReferenceHolo", holo or game.getWorld() )
+end
+
+function ThisClass:getReferenceHolo()
+    return self._referenceHolo
+end
+
+
+----- OVERRIDABLE FUNCTIONS -----
+
+
+
+----- IMPLEMENTED FUNCTIONS -----
+
+function ThisClass:canShowScreenHolo( eyePos, _eyeAng )
+    local refHolo = self:getReferenceHolo()
+    if not isValid( refHolo ) then return false end
+
+    --local refPos = refHolo:getPos()
+    local refPos = refHolo:obbCenterW()
+    local refRadius = refHolo:obbSize()[3] * refHolo:getScale()[3] / 2
+
+    return ( eyePos - refPos ):getLengthSqr() <= refRadius ^ 2
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+
+
+----- SETUP -----
+
+if SERVER then return end
+
+
+net.receive( "LKL_Syncable_Set__SphereInsideAnimation_ReferenceHolo", function()
+    local anim = Syncable:readSyncedCopy()
+    local ent = net.readEntity()
+
+    if not anim then return end
+
+    anim:setReferenceHolo( isValid( ent ) and ent:toHologram() or nil )
+end )

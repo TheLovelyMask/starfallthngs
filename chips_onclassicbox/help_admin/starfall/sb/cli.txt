@@ -1,0 +1,947 @@
+--@name CLI
+--@author shrooblooms
+--@shared
+--@include sb/util.txt
+--@include sb/delta_os.txt
+--@include sb/command_parser.txt
+--@include sb/entity_networker_v2.txt
+
+
+local Util = require("sb/util.txt")
+local CommandParser = require("sb/command_parser.txt")
+local DeltaOS = require("sb/delta_os.txt")
+local EntityNetworker = require("sb/entity_networker_v2.txt")
+
+
+
+--TODO: make sure users cant get on when other users are on
+
+
+
+-- TODO
+-- [X] Make hud disconnect delayed and have calcview interpolate out as well
+-- [ ] BUG: it's possible to steal someone's connection
+-- [ ] Reduce font size and add auto-newline support for :log()?
+
+
+
+local STARTUP_TIME = 5
+
+
+
+local CLI = {}
+CLI.Commands = CommandParser:new()
+CLI.User = nil
+CLI.LastUser = nil
+CLI.Lines = {}
+CLI.VERSION = "2.2b"
+CLI.Zoom = 0.75
+
+CLI.MOTDs = {
+    "Welcome to the terminal.",
+    "All systems operational.",
+    "Look, Gordon! Ropes!",
+    "Error: Filesystem not found.",
+    "Behind you.",
+    "Don't press ALT+F4.",
+    "If you get stuck, call a technician.",
+    "Insert MOTD here.",
+    "Your gender is valid.",
+    "May contain nuts!",
+    "That startup was pretty cool, right?",
+    "The OS theme uses your Physgun colour.",
+    "Device I/O Listening.",
+    "Hiiiiiii!!!!",
+    "Ceci n'est pas un MOTD.",
+    "sqrt(-1) love you!",
+    "Made by shrooblooms!",
+    "Now with multi-threading!",
+    "Successfully built with 3,522 errors and 10,502 warnings.",
+    "UwU",
+    "Skynet online.",
+    "(C) Aperture Science, 2022-2025"
+}
+
+
+CLI.ScreenEntity = nil
+
+function CLI:setScreenEntity( ent )
+    if SERVER then
+        if isValid(CLI.ScreenEntity) then
+            EntityNetworker:remove("cli_screen", CLI.ScreenEntity)
+        end
+        
+        if isValid(ent) then
+            EntityNetworker:add( "cli_screen", ent )
+        end
+    end
+    
+    CLI.ScreenEntity = ent
+end
+
+
+if CLIENT then
+    EntityNetworker:add( "cli_screen", function( ent )
+        CLI:setScreenEntity( ent )
+    end)
+end
+
+
+
+function CLI:formatTargets( targets )
+    if #targets == #find.allPlayers() then
+        return "Everyone"
+    end
+    
+    local str = ""
+    for i,v in pairs(targets) do
+        str = str .. v:getName() .. (i < #targets and (i == #targets - 1 and ", and " or ", ") or "")
+    end
+    
+    return str
+end
+
+
+
+
+
+
+local Error = CommandParser.Error
+
+
+if SERVER then
+    Util.lockControlsInHud( true )
+end
+
+
+-- Max lines stored in memory
+local MAX_LINES = 64
+
+
+
+function CLI:log( message, loopback )
+    
+    local lines = message:split("\n")
+    --local lines = {message} --temp
+    --[[local i = 0
+    
+    while i < #lines do
+        i = i + 1
+        local v = lines[i]
+        
+        local words = v:split(" ")
+        local len = 0
+        
+        for _,w in pairs(words) do
+            if len + w:len() > LINE_LIMIT then
+                lines[i] = v:sub(1, len)
+                table.insert(lines, v:sub(len+1))
+                break
+            end
+            
+            len = len + w:len() + 1
+        end
+    end]]
+    
+    for i,v in pairs(lines) do
+        table.insert(CLI.Lines, v)
+    end
+    
+    
+    while #CLI.Lines > MAX_LINES do
+        table.remove(CLI.Lines, 1)
+    end
+    
+    
+    if SERVER then
+        net.start("CLI_log")
+            net.writeString( message )
+        net.send( loopback and find.allPlayers() or Util.everyoneExcept(CLI.User) )
+    else
+        CLI.redraw()
+    end
+    
+    --table.insert(CLI.Lines, message)
+end
+
+
+
+function CLI:clear( loopback )
+    table.empty(CLI.Lines)
+    
+    if CLIENT then
+        CLI.redraw()
+    else
+        net.start("CLI_setLines")
+            net.writeTable({})
+        net.send( loopback and find.allPlayers() or Util.everyoneExcept(CLI.User) )
+    end
+end
+
+
+
+
+
+local function linuxifyName( name )
+    return name:lower():replace(" ", "_")
+end
+
+local function getPrefix( userName )
+    return linuxifyName(userName) .. ":~$ "
+end
+
+
+
+
+-- Doesn't render the prompt line and doesnt let the user type until the server responds
+-- Useful for making serverside commands not look jarring. Does not actually yield/await.
+function CLI.awaitServer()
+    if CLIENT then
+        coroutine.yield()
+    else
+        net.start("CLI_response")
+        net.send(CLI.User)
+    end
+end
+
+
+function CLI.alternateView()
+    CLI.CameraDelegated = true
+    
+    if CLIENT then
+        coroutine.yield()
+    else
+        net.start("CLI_response")
+        net.send(CLI.User)
+    end
+end
+
+
+
+
+if CLIENT then
+    
+    net.receive("CLI_response", function()
+        if not CLI.CommandThread then return end
+        coroutine.resume(CLI.CommandThread)
+    end)
+    
+    net.receive("CLI_log", function()
+        CLI:log( net.readString() )
+    end)
+    
+    net.receive("CLI_setLines", function()
+        table.empty(CLI.Lines)
+        
+        for i,v in pairs(net.readTable()) do
+            table.insert(CLI.Lines, v)
+        end
+        
+        CLI.redraw()
+    end)
+    
+    
+    
+    CLI.PromptText = ""
+    local EntryTimer = 0
+    
+    local LINE_HEIGHT = 36
+    
+    local Fonts = {}
+    Fonts.Line = render.createFont("Roboto Mono", LINE_HEIGHT)
+    
+    
+    --[[for i,v in pairs(find.allPlayers()) do
+        print(i, v:getName(), linuxifyName(v:getName()))
+    end]]
+    
+    
+    function renderCLI()
+        
+        render.clear(Color(0,0,0,0))
+        
+        if not CLI.PowerState or not isValid(CLI.ScreenEntity) then return end
+        
+        
+        local sX, sY = render.getResolution()
+        sY = sY * render.getScreenInfo( CLI.ScreenEntity ).RatioX
+        
+        local cX, cY = sX/2, sY/2
+        
+        
+        CLI.StartupTimer = CLI.StartupTimer + timer.frametime()
+        
+        -- Startup sequence
+        if CLI.StartupTimer < STARTUP_TIME then
+            
+            local consoleH = sY*0.46
+            local consoleW = consoleH*1.7 --fixed ratio
+            local consoleX, consoleY = cX - consoleW/2, sY*0.1
+            
+            
+            if isValid(ScreenEntity) and math.random() < 0.05 then
+                CLI.ScreenEntity:emitSound("sb.click")
+            end
+            
+            
+            render.setColor(Color(0,0,0))
+            render.drawRect( 0,0, sX,sY )
+            
+            if CLI.StartupTimer < 0.5 or CLI.StartupTimer > (STARTUP_TIME-1.5) then return end
+            
+            
+            render.setColor( DeltaOS.getPreferredColor() )
+            
+            DeltaOS.drawBootMenu( consoleX, consoleY, consoleH, CLI.StartupTimer, STARTUP_TIME, {
+                SystemName = "CLI Terminal ver." .. CLI.VERSION,
+                RAM = 16777216,
+                Screen = CLI.ScreenEntity,
+                
+                TableMessage = "Device I/O Listening..."
+            })
+            
+            return
+        end
+        
+        
+        render.setColor(DeltaOS.getPreferredColor())
+        render.setFont(Fonts.Line)
+        
+        DeltaOS.drawOutlinedBox( sX*0.01, sY*0.01, sX*0.98, sY*0.98 )
+        
+        --local h = sY*0.025
+        local lineCount = 0
+        local MaxLines = math.floor((sY - 0.05) / LINE_HEIGHT) - 3
+        
+        --[[for i,v in pairs(CLI.Lines) do
+            render.drawSimpleText( sX*0.025, sY*0.025 + (i-1)*LINE_HEIGHT, v, 0, 0 )
+            h = h + LINE_HEIGHT
+            
+            if h > sY*0.975 then
+                break
+            end
+        end]]
+        
+        for i=#CLI.Lines - MaxLines + 1, #CLI.Lines do
+            if not CLI.Lines[i] then continue end
+            render.drawSimpleText( sX*0.025, sY*0.025 + lineCount*LINE_HEIGHT, CLI.Lines[i], 0, 0 )
+            lineCount = lineCount + 1
+        end
+        
+        
+        render.drawSimpleText(sX*0.025, sY*0.975, "[Alt] Exit", nil, TEXT_ALIGN.BOTTOM)
+        render.drawSimpleText(sX*0.975, sY*0.975, os.date( "%I:%M %p" ):upper(), TEXT_ALIGN.RIGHT, TEXT_ALIGN.BOTTOM)
+        
+        if CLI.CommandThread ~= nil then return end
+        if not isValid(CLI.LastUser) then return end --TODO?
+        
+        local h = sY*0.025 + lineCount*LINE_HEIGHT
+        
+        local prefix = getPrefix( CLI.LastUser:getName() ) .. CLI.PromptText
+        local w = render.getTextSize( prefix )
+        render.drawSimpleText(sX*0.025, h, prefix)
+        
+        -- Text cursor
+        -- black magic? yes
+        -- do i care? no.
+        render["drawRect" .. (render.isHUDActive() and "" or "Outline")]( sX*0.025 + w, h + 2, LINE_HEIGHT/2, LINE_HEIGHT )
+        
+    end
+    
+    
+    Util.createRenderTarget( "main", renderCLI)
+    
+    function CLI.redraw()
+        Util.modifyRenderTarget( "main", renderCLI)
+    end
+    
+    
+    --TODO: should this be a screen + zoom camera in or a hud with darkened background?
+    hook.add("render", "CLI_Draw", function()
+        if not isValid(CLI.ScreenEntity) then
+            CLI.ScreenEntity = render.getScreenEntity()
+        elseif render.getScreenEntity() ~= CLI.ScreenEntity then
+            return
+        end
+        
+        local sX, sY = render.getResolution()
+        
+        if CLI.PowerState and CLI.StartupTimer < STARTUP_TIME then
+            CLI.redraw()
+            
+            render.setRenderTargetTexture("main")
+            render.drawTexturedRect(sX/2-256,0,512,512)
+        else
+            render.setRenderTargetTexture("main")
+            render.drawTexturedRect(0,0,sX,sX)
+        end
+    end)
+    
+    
+    function CLI.kickLocalClient()
+        input.lockControls(false)
+        enableHud(player(), false)
+        
+        CLI.PromptText = ""
+    end
+    
+    hook.add("Removed", "CLI_RemoveOnUpdate", function()
+        if render.isHUDActive() then
+            CLI.kickLocalClient()
+        end
+    end)
+    
+    
+    hook.add("hudconnected", "CLI_HudConnect", function()
+        if CLI.User ~= nil then
+            return CLI.kickLocalClient()
+        end
+        
+        net.start("CLI_enter")
+        net.send()
+        
+        CLI.setUser( player() )
+        
+        CLI.redraw()
+    end)
+    
+    hook.add("huddisconnected", "CLI_HudDisconnect", function()
+        CLI.redraw()
+        
+        net.start("CLI_exit")
+        net.send()
+        
+        if CLI.User == player() then
+            CLI.setUser( nil )
+        end
+        
+        EntryTimer = 0
+        
+    end)
+    
+    
+    
+    local Shift = false
+    
+    local UPPERCASE = {
+        ["-"] = "_",
+        ["="] = "+",
+        ["`"] = "~",
+        [","] = "<",
+        ["."] = ">",
+        ["/"] = "?",
+        ["["] = "{",
+        ["]"] = "}",
+        
+        ["1"] = "!",
+        ["2"] = "@",
+        ["3"] = "#",
+        ["4"] = "$",
+        ["5"] = "%",
+        ["6"] = "^",
+        ["7"] = "&",
+        ["8"] = "*",
+        ["9"] = "(",
+        ["0"] = ")"
+    }
+    
+    
+    hook.add("inputPressed", "CLI_Type", function( key )
+        if key == KEY.SHIFT then
+            Shift = true
+            return
+        end
+        
+        if not render.isHUDActive() or CLI.AwaitingServerResponse or CLI.StartupTimer < STARTUP_TIME then return end
+        
+        local char = input.getKeyName(key)
+        
+        if Shift then
+            char = UPPERCASE[char] or char:upper()
+        end
+        
+        
+        if key == KEY.ENTER then
+            CLI.runString( player(), CLI.PromptText )
+            
+            CLI.PromptText = ""
+            CLI.redraw()
+            return
+        elseif key == KEY.BACKSPACE then
+            CLI.PromptText = string.sub(CLI.PromptText, 1, CLI.PromptText:len()-1)
+            CLI.redraw()
+            return
+        elseif key == KEY.SPACE then
+            char = " "
+        end
+        
+        if char:len() > 1 then return end
+        
+        CLI.PromptText = CLI.PromptText .. char
+        CLI.redraw()
+    end)
+    
+    
+    hook.add("inputReleased", "CLI_Type", function( key )
+        if key == KEY.SHIFT then
+            Shift = false
+            return
+        end
+    end)
+    
+    
+    local function disconnect()
+        if not render.isHUDActive() or CLI.User ~= player() then return end
+        
+        CLI.setUser(nil)
+        
+        net.start("CLI_exit")
+        net.send()
+        
+        input.lockControls(false)
+    end
+    
+    Util.bindPress("ALT", function()
+        disconnect()
+    end)
+    
+    Util.bindPress("RALT", function()
+        disconnect()
+    end)
+    
+    
+    CLI.CameraDelegateProgress = 0
+    CLI.CameraDelegated = false
+    
+    --@include sb/debug.txt
+    local Debug = require("sb/debug.txt")
+    
+    hook.add("calcview", "CLI_camera", function( pos, ang, fov )
+        if not isValid(CLI.ScreenEntity) then return end
+        
+        local cameraTransitionGoal = CLI.CameraDelegated and 1 or 0
+        
+        if CLI.CameraDelegateProgress ~= cameraTransitionGoal then
+            CLI.CameraDelegateProgress = math.approach( CLI.CameraDelegateProgress, cameraTransitionGoal, timer.frametime()/0.2 )
+            
+            if CLI.CameraDelegateProgress == 1 then return end
+        end
+        
+        EntryTimer = math.clamp(EntryTimer + (CLI.User == player() and 1 or -1)*timer.frametime()/0.4, 0, 1)
+        
+        if EntryTimer == 0 and CLI.User ~= player() then
+            enableHud( player(), false )
+        end
+        
+        
+        local info = render.getScreenInfo(CLI.ScreenEntity)
+        local validModel = info.y1 ~= 0 or info.y2 ~= 0
+        
+        --[[local tilt = math.sin(math.pi*CLI.CameraDelegateProgress) * 10
+        
+        local a = Util.smoothCurve( EntryTimer/0.35 )
+        local goalAng = ScreenEntity:localToWorldAngles(info.rot + (validModel and Angle(0,90,90) or Angle(90,0,90)))
+        local verticalSize = validModel and info.y2 - info.y1 or ScreenEntity:obbSize().x
+        local dist = math.tan( math.rad(fov/2) ) * verticalSize * 0.75 * (1 - CLI.CameraDelegateProgress^2 * 0.5)
+        local offset = info.offset + Vector(
+            info.z,
+            (info.x2 + info.x1)/2,
+            (info.y2 + info.y1)/2
+        )
+        
+        Debug.periodicPrintTable( "asdf", 1, info )
+        
+        local goalPos = ScreenEntity:localToWorld(offset) - goalAng:getForward()*dist
+        
+        return {
+            origin = math.lerpVector( a, pos, goalPos ),
+            angles = math.lerpAngle( a, ang, goalAng ) + Angle(0,0,tilt)
+        }]]
+        
+        
+        local tilt = -math.sin(math.pi*EntryTimer) * 20
+        local rotation, translation, translateLocalToScreen, scale = Matrix(), Matrix(), Matrix(), Matrix(), Matrix()
+        rotation:setAngles(info.rot)
+        rotation:rotate(Angle(-90,0,90 + tilt))
+        translation:setTranslation(info.offset)
+        
+        local verticalSize = validModel and info.y2 - info.y1 or CLI.ScreenEntity:obbSize().x
+        
+        --TODO: camera delegate (or maybe don't since we're trying to move away from CLI used for everything)
+        local dist = math.tan( math.rad(fov/2) ) * verticalSize * 0.75 --* (1 - CLI.CameraDelegateProgress^2 * 0.5)
+        translateLocalToScreen:setTranslation( Vector(-dist,0,0) )
+        
+        -- do we even need the scale? its being applied last
+        scale:setScale(Vector(info.RS, info.RS, info.RS))
+        
+        local screenMatrix = translation * rotation * translateLocalToScreen * scale
+        local worldMatrix = CLI.ScreenEntity:getMatrix() * screenMatrix
+        
+        --[[local mk = Debug.marker("view", worldMatrix:getTranslation())
+        mk:setAngles(worldMatrix:getAngles())
+        mk:setModel("models/sprops/misc/bone_from_x.mdl")
+        
+        local mk2 = Debug.marker("view2", worldMatrix:getTranslation())
+        mk2:setAngles(worldMatrix:getAngles())
+        mk2:setModel("models/sprops/misc/bone_from_y.mdl")]]
+        
+        local camGoalPos = worldMatrix:getTranslation()
+        local camGoalAng = worldMatrix:getAngles()
+        local a = math.easeInOutQuad( EntryTimer ) --Util.smoothCurve( EntryTimer )
+        
+        return {
+            origin = math.lerpVector( a, pos, camGoalPos ),
+            angles = math.lerpAngle( a, ang, camGoalAng )
+        }
+    end)
+    
+    
+    net.receive("CLI_setUser", function()
+        if not net.readBool() then
+            CLI.setUser( nil )
+        else
+            net.readEntity(CLI.setUser)
+        end
+    end)
+    
+end
+
+
+
+function CLI.setUser( NewUser, Loopback )
+    if CLI.User == NewUser then return end
+    
+    -- Assuming you've connected to the hud on client already
+    
+    if SERVER then
+        if not isValid(NewUser) then
+            local OldChair = CLI.User:getVehicle()
+            
+            if isValid(OldChair) and OldChair:getOwner() == owner() then
+                CLI.User:getVehicle():ejectDriver()
+            end
+        end
+        
+        net.start("CLI_setUser")
+        net.writeBool(NewUser ~= nil)
+        
+        if NewUser then
+            net.writeEntity(NewUser)
+        end
+        
+        if Loopback then
+            net.send()
+        else
+            net.send( Util.everyoneExcept(NewUser, CLI.User) )
+        end
+    end
+    
+    --TODO: do this only if its received from net
+    if CLIENT and render.isHUDActive() and (NewUser ~= player()) then
+        --CLI.kickLocalClient()
+    end
+    
+    --[[if CLIENT and render.isHUDActive() then
+        if NewUser ~= player() then
+            input.lockControls( false )
+        else
+            if input.canLockControls() then
+                input.lockControls( true )
+            end
+        end
+    end]]
+    
+    --print("User set from " .. tostring(CLI.User) .. " to " .. tostring(NewUser) .. ". (SERVER: " .. tostring(SERVER) ..")")
+    CLI.User = NewUser
+    
+    if NewUser then
+        CLI.LastUser = NewUser
+    end
+    
+    
+    if SERVER and NewUser and not CLI.PowerState then
+        CLI.setPowerState( true )
+    end
+    
+end
+
+
+
+--TODO: if steam friends and in squad then give permission level 2?
+--TODO: make this a base thing?
+function CLI.getPermissionLevel( User )
+    if User == owner() then return 3 end
+    if Util.isInMySquad( User ) then return 1 end
+    
+    return 0
+end
+
+
+--[[ POWER STATE ]]--
+CLI.PowerState = false
+CLI.StartupTimer = 0
+
+function CLI.setPowerState( State )
+    if CLI.PowerState == State then return end
+    
+    CLI.PowerState = State
+    
+    if not State and CLI.User then
+        CLI.setUser(nil, true)
+    end
+    
+    if SERVER then
+        net.start("CLI_setPowerState")
+            net.writeBool( State )
+        net.send()
+        
+        local Screen = Util.getScreenEntity()
+        
+        if Screen then
+            Screen:emitSound(DeltaOS.Sound[State and "POWER_ON" or "POWER_OFF"])
+        end
+    end
+    
+    if CLIENT then
+        CLI.StartupTimer = 0
+        
+        if not State and render.isHUDActive() then
+            input.lockControls(false)
+        end
+    end
+    
+    if SERVER then
+        if State then
+            local motd = table.random(CLI.MOTDs)
+            CLI:log(motd, true)
+            CLI:log("Type 'help' for a list of commands.", true)
+        else
+            CLI:clear()
+        end
+    end
+end
+
+if CLIENT then
+    net.receive("CLI_setPowerState", function()
+        CLI.setPowerState(net.readBool())
+    end)
+end
+
+
+function CLI.runString( user, msg )
+    CLI:log(getPrefix( CLI.LastUser:getName() ) .. msg)
+    
+    if CLIENT then
+        net.start("CLI_executeCommand")
+        net.writeString(msg)
+        net.send()
+    end
+    
+    if msg == "" then return end
+    
+    local cmd, args, err = CLI.Commands:parse( msg )
+    
+    if err then
+        return CLI:log( "Parse Error: " .. err.Message )
+    end
+    
+    Util.spawn(function()
+        CLI.CommandThread = coroutine.running()
+        local err = cmd.Run( ply, unpack(args) )
+        
+        if err then
+            return CLI:log( "Command Error: " .. err.Message )
+        end
+        
+        CLI.CommandThread = nil
+        
+        if CLIENT then
+            CLI.redraw()
+        end
+    end)
+end
+
+
+
+if SERVER then
+    net.receive("CLI_executeCommand", function(_, user)
+        
+        if user ~= CLI.User then return end
+        
+        local msg = net.readString()
+        CLI.runString(player(), msg)
+        
+    end)
+    
+    hook.add("ClientInitialized", "CLI_initialNetwork", function(p)
+        net.start("CLI_setLines")
+            net.writeTable(CLI.Lines)
+        net.send(p)
+    end)
+    
+    
+    net.receive("CLI_enter", function(_, ply)
+        if CLI.User then return end
+        
+        CLI.setUser( ply )
+    end)
+    
+    net.receive("CLI_exit", function(_, ply)
+        if CLI.User ~= ply then
+            if ply:getVehicle():isValid() and ply:getVehicle():getOwner() == owner() then
+                ply:getVehicle():ejectDriver()
+            end
+        end
+        
+        CLI.setUser( nil )
+    end)
+    
+    
+    Util.lockControlsInHud( true )
+    
+    
+    hook.add("EntityTakeDamage", "CLI_ejectOnDamage", function(target)
+        if target == CLI.User then
+            CLI.setUser( nil )
+        end
+    end)
+    
+end
+
+
+
+
+hook.add("PlayerDisconnect", "CLI_ejectDisconnected", function( _, _, plr )
+    if CLI.User ~= plr then return end
+    CLI.setUser( nil )
+end)
+
+
+
+CLI.Commands:add({ 
+    Name = "help", 
+    Description = "Shows the help menu.",
+    Arguments = {
+        {
+            Name = "command",
+            Type = "string",
+            Optional = true,
+            Validator = function( command )
+                if not CLI.Commands:get(command) then
+                    return Error( "Unknown Command: \"" .. tostring(command) .. "\"" )
+                end
+            end
+        }
+    },
+    Run = function( user, command )
+        
+        if not command then
+            local out = "| List of Commands\n------------------------\n"
+            local maxListDigit = math.ceil(math.log10( CLI.Commands:getCount() ))
+            
+            for i,v in pairs(CLI.Commands:getAll()) do
+                local argList = ""
+                
+                for i,v in pairs(v.Arguments) do
+                    argList = argList .. "<" .. v.Name .. (v.Optional and "?" or "") .. "> "
+                end
+                
+                out = out .. i .. "." .. (" "):rep(maxListDigit - math.floor(math.log10(i))) .. v.Name .. " " .. argList .. "\n"
+            end
+            
+            CLI:log(out)
+        else
+            
+            local cmdData = CLI.Commands:get( command )
+            
+            if not cmdData then
+                return Error("Unknown command '" .. command .. "'.")
+            end
+            
+            
+            local out = "- " .. cmdData.Name .. ": " .. cmdData.Description
+            
+            if #cmdData.Aliases > 0 then
+                out = out .. "\nAliases: "
+                
+                for i,v in pairs(cmdData.Aliases) do
+                    out = out .. v .. (i < #cmdData.Aliases and ", " or "")
+                end
+            end
+            
+            if cmdData.PermissionLevel then
+                out = out .. "\nPermission Level: " .. cmdData.PermissionLevel
+            end
+            
+            if #cmdData.Arguments > 0 then
+                out = out .. "\nArguments: \n"
+                
+                for i,v in pairs(cmdData.Arguments) do
+                    out = out .. i .. ". " .. v.Type .. " " .. v.Name .. (v.Optional and "" or " (Optional)") .. (i < #cmdData.Arguments and "\n" or "")
+                end
+            end
+            
+            out = out .. "\n"
+            
+            CLI:log(out)
+        end
+    end
+})
+
+
+
+CLI.Commands:add({
+    Name = "clear", 
+    Description = "Clears the console.",
+    Run = CLI.clear
+})
+
+
+
+CLI.Commands:add({ 
+    Name = "echo", 
+    Description = "Repeats a message back to you for testing purposes.",
+    Arguments = {
+        {
+            Name = "message",
+            Type = "string",
+            Optional = true
+        }
+    }, 
+    Run = function( user, message )
+        CLI:log( message or "ECHO is on." )
+    end
+})
+
+
+
+
+CLI.Commands:add({ 
+    Name = "shutdown",
+    Aliases = {"shut", "off"},
+    Description = "Turns the terminal off.",
+    Run = function( user )
+        CLI:log("Powering down...")
+        
+        if SERVER then
+            CLI.setPowerState( false )
+        end
+        
+        CLI.awaitServer()
+    end
+})
+
+
+CLI.Commands:add({ 
+    Name = "version",
+    Description = "Prints the version of the OS.",
+    Run = function( user )
+        CLI:log("Currently running CLI ver." .. CLI.VERSION)
+    end
+})
+
+
+
+
+return CLI
+

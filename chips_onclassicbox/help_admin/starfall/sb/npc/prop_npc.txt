@@ -1,0 +1,122 @@
+--@name Prop NPC Utils
+--@author shroobloom
+--@server
+
+
+-- For helping with Prop-based NPCs
+
+
+--TODO: rework this, it should probably be an entity wrapper and stored inside NPC
+-- Deprecated. Do not use this for future works. ^^
+
+local PropNPC = class("PropNPC")
+PropNPC.Instances = {}
+PropNPC.Reference = {}
+
+
+
+function PropNPC.setup( ent, name, maxHealth, damageCallback )
+    
+    ent.Health = maxHealth
+    ent.MaxHealth = maxHealth
+    ent.Invincible = false
+    
+    ent.MeleeDamageMultiplier = 1
+    ent.ExplosiveDamageMultiplier = 1
+    ent.DamageMultiplier = 1
+    
+    ent.DeathSequenceLength = 0
+    
+    ent.Name = name
+    
+    ent:setMass(50000)
+    
+    hook.add("EntityTakeDamage", "PropNPC_DamageDetector_" .. ent:entIndex(), function( victim, attacker, inflictor, amount, dmgType, position )
+        if victim ~= ent then return end
+        if ent.Invincible then return true end
+        if ent.Health <= 0 then return true end
+        if not isValid(attacker) then return true end
+        
+        if not attacker:isPlayer() then
+            if not isValid(inflictor) then return true end
+            
+            local propOwner = inflictor:getOwner()
+            if not isValid(propOwner) or propOwner:isInBuild() then return true end
+            
+            attacker = propOwner
+        end
+        
+        
+        --[[ MULTIPLIERS ]]--
+        amount = amount * ent.DamageMultiplier
+        
+        if dmgType == DAMAGE.CRUSH or dmgType == DAMAGE.SLASH or dmgType == DAMAGE.CLUB or (isValid(inflictor) and inflictor:getClass() == "cw_extrema_ratio_official") then
+            amount = amount * ent.MeleeDamageMultiplier
+        elseif dmgType == DAMAGE.BLAST then
+            amount = amount * ent.ExplosiveDamageMultiplier
+        end
+        
+        local mul = damageCallback and damageCallback(victim, attacker, inflictor, amount, dmgType, position ) or 1
+        
+        ent.Health = ent.Health - amount*mul
+        
+        if ent.HealthBar then
+            ent.HealthBar:setHealth(ent.Health)
+        end
+        
+        if ent.Health <= 0 then
+            hook.run("NPCDeath", victim, attacker, inflictor, dmgType )
+            
+            timer.simple(ent.DeathSequenceLength, function()
+                ent:remove()
+            end)
+        end
+        
+        return true
+    end)
+    
+    table.insert(PropNPC.Instances, ent)
+end
+
+
+function PropNPC.setInvincible( ent, state )
+    ent.Invincible = state
+    
+    if ent.HealthBar then
+        ent.HealthBar:setColor( state and Color(170,170,170) or Color(255,0,0) )
+        ent.HealthBar:setDecayColor( state and Color(100,100,100) or Color(255,156,3) )
+    end
+end
+
+
+
+if SERVER then
+    -- Anti-shapecharge cheese
+    timer.create("prop_npc_shapecharge_remover", 0.5, 0, function()
+        for i,subject in pairs(PropNPC.Instances) do
+            local min, max = subject:worldSpaceAABB()
+            
+            local sc = find.inBox( min - Vector(300,300,300), max + Vector(300,300,300), function(e)
+                return isValid(e) and e:getClass() == "cfc_shaped_charge"
+            end)
+            
+            for i,v in pairs(sc) do
+                pcall(function() v:remove() end)
+            end
+        end
+    end)
+end
+
+
+hook.add("EntityRemoved", "prop_npc_removed", function( e )
+    if not e or not e.Health then return end
+    table.removeByValue( PropNPC.Instances, e )
+    
+    hook.remove("EntityTakeDamage", "PropNPC_DamageDetector_" .. e:entIndex())
+end)
+
+
+
+
+
+return PropNPC

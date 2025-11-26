@@ -1,0 +1,637 @@
+--@name Data Pearl Reader
+--@author legokidlogan
+--@server
+--@model models/sprops/misc/domes/size_0/dome_6x3.mdl
+
+-- A legacy version of Data Pearl Reader that doesn't use any includes. Will not be maintained.
+
+--[[
+    - Reads/writes data from/to a Data Pearl.
+    - Usage:
+        - Place a pearl close to the reader and it will automatically be pulled in and hover above the reader.
+        - Once the pearl settles, the reader's wire outputs will contain the pearl's data, and the set and lock buttons can be used.
+        - The four buttons on the reader can be interacted with by looking at them and pressing your 'use' key (E).
+        - Press the set button to write data from the reader's wire inputs to the pearl.
+            - Either the DataStringIn or DataCompressedIn input can be used, with priority given to DataCompressedIn.
+        - Press the lock button (X when locked, - when unlocked) to (un)lock the pearl, welding it to the reader.
+        - Press the power button (green when powered, red when off) to (un)power the reader.
+        - Press the owner only button (cyan when on, green when off) to (dis)allow other players to press the other buttons.
+        - While the reader is unlocked, you can pick up the pearl or physically hit it out of the reader's range to make it stop reading.
+        - The ForceEject, ForceEjectWithSpeed, and ForceEjectUpWithSpeed wire inputs can be used to eject the pearl as well.
+            - ForceEject will eject the pearl with default spread and speed.
+            - ForceEjectWithSpeed will eject the pearl with default spread and the given speed.
+            - ForceEjectUpWithSpeed will eject the pearl straight up relative to the reader with the given speed.
+        - The Data, DataString, and DataCompressed wire outputs will contain the pearl's data, while other outputs track the reader's state.
+
+    - This chip should be standalone, but if you include it in another script, keep the @name directory as "Data Pearl Reader" so readers can identify each other.
+    - Note that the Data output will be an empty table if DataString is not in JSON format.
+--]]
+
+
+-- CONFIG
+local READER_BUTTON_RANGE = 100
+
+local PEARL_SEARCH_RADIUS = 40
+local PEARL_PULL_STRENGTH = 75
+local PEARL_PULL_DAMPENING = 4
+local PEARL_SETTLE_RADIUS = 2.5
+local PEARL_SETTLE_SPEED_THRESHOLD = 50
+local PEARL_CAN_UNSETTLE = true
+local PEARL_UNSETTLE_RADIUS = 5
+local PEARL_HOLD_OFFSET_POS = Vector( 0, 0, 10 )
+
+local PULL_SOUND_VOLUME = 0.75
+local PULL_SOUND_VOLUME_SETTLED = 0.25
+local PULL_SOUND_VOLUME_FADE_START = 0.25
+local PULL_SOUND_VOLUME_FADE = 0.5
+local PULL_SOUND_PITCH_MIN = 80
+local PULL_SOUND_PITCH_MAX = 140
+local PULL_SOUND_PITCH_SPEED_MIN = 20
+local PULL_SOUND_PITCH_SPEED_MAX = 150
+
+local EJECT_DEFAULT_STRENGTH_MIN = 200
+local EJECT_DEFAULT_STRENGTH_MAX = 300
+local EJECT_DEFAULT_SPREAD = 90
+-- END CONFIG
+
+
+local btnSet = nil
+local btnLock = nil
+local btnPower = nil
+local btnOwnerOnly = nil
+local pearl = nil
+local lockWeld = nil
+local pullSound = nil
+local pearlSettled = false
+local locked = false
+local powered = true
+local ownerOnly = true
+local ready = false
+
+local data = {}
+local dataString = ""
+local dataCompressed = ""
+local dataStringIn = ""
+local dataCompressedIn = ""
+
+prop.setPropUndo( false )
+prop.setPropClean( true )
+
+wire.adjustInputs( { "DataStringIn", "DataCompressedIn", "ForceEject", "ForceEjectWithSpeed", "ForceEjectUpWithSpeed" }, { "STRING", "STRING", "NUMBER", "NUMBER", "NUMBER" } )
+wire.adjustOutputs( { "Data", "DataString", "DataCompressed", "Pearl", "HasAPearl", "PearlSettled", "Powered", "Locked", "OwnerOnly" }, { "TABLE", "STRING", "STRING", "ENTITY", "NUMBER", "NUMBER", "NUMBER", "NUMBER", "NUMBER" } )
+
+wire.ports.Powered = powered and 1 or 0
+wire.ports.Locked = locked and 1 or 0
+wire.ports.OwnerOnly = ownerOnly and 1 or 0
+
+if chip():getMaterial() == "" then
+    chip():setMaterial( "phoenix_storms/FuturisticTrackRamp_1-2" )
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+-- Different from HRM's hookRunRemoteFixed() as this ignores empty responses and returns false if no valid results were found.
+local function hookRunRemoteSafe( targets, hookName, ... )
+    local results
+    local args = { ... }
+
+    if type( targets ) == "table" then
+        results = {}
+
+        for _, target in ipairs( targets ) do
+            local result = hookRunRemoteSafe( target, hookName, unpack( args ) )
+
+            if result then
+                table.insert( results, result[1] )
+            end
+        end
+
+        if #results == 0 then
+            return false
+        end
+
+        return results
+    end
+
+    if not isValid( targets ) or not targets:hasInstance() then return false end
+
+    pcall( function()
+        results = hook.runRemote( targets, hookName, unpack( args ) )
+    end )
+
+    if results and not results[1] then
+        return false
+    end
+
+    return results
+end
+
+local function spreadVector( dir, pitchRange, yawRange )
+    local pitchDeg = math.rand( -pitchRange, pitchRange ) / 2
+    local yawDeg = math.rand( -yawRange, yawRange ) / 2
+
+    local ang = dir:getAngle()
+    local right = ang:getRight()
+    local up = ang:getUp()
+
+    ang = ang:rotateAroundAxis( right, pitchDeg )
+    ang = ang:rotateAroundAxis( up, yawDeg )
+
+    return ang:getForward()
+end
+
+local function setData( tbl, str, compressed )
+    data = tbl or {}
+    dataString = str or ""
+    dataCompressed = compressed or ""
+
+    wire.ports.Data = data
+    wire.ports.DataString = dataString
+    wire.ports.DataCompressed = dataCompressed
+end
+
+local function updateLockButton()
+    btnLock:setSubMaterial( 1, locked and "models/cheeze/buttons2/multiply" or "models/cheeze/buttons2/minus" )
+end
+
+local function updatePowerButton()
+    btnPower:setColor( powered and Color( 0, 255, 0, 255 ) or Color( 255, 0, 0, 255 ) )
+end
+
+local function updateOwnerOnlyButton()
+    btnOwnerOnly:setColor( ownerOnly and Color( 0, 255, 255, 255 ) or Color( 0, 255, 0, 255 ) )
+end
+
+local function setLocked( state )
+    if locked == state then return end
+
+    if not state then
+        if isValid( lockWeld ) then
+            lockWeld:remove()
+        end
+
+        lockWeld = nil
+        locked = false
+        wire.ports.Locked = 0
+        updateLockButton()
+
+        return
+    end
+
+    if not isValid( pearl ) then return end
+    if not pearlSettled then return end
+
+    locked = true
+    wire.ports.Locked = 1
+    updateLockButton()
+
+    pearl:setPos( chip():localToWorld( PEARL_HOLD_OFFSET_POS ) )
+    lockWeld = constraint.weld( chip(), pearl )
+end
+
+local function dropPearl( ejectVel )
+    if locked then return end
+    if not isValid( pearl ) then return end
+
+    local resultsIsBeingGrabbed = hookRunRemoteSafe( pearl, "LKL_DataPearl_IsBeingGrabbed" )
+    if not ( resultsIsBeingGrabbed and resultsIsBeingGrabbed[1][1] ) then
+        pearl:enableGravity( true )
+    end
+
+    if pullSound then
+        local snd = pullSound
+        pullSound = nil
+
+        snd:setVolume( 0, PULL_SOUND_VOLUME_FADE )
+
+        timer.simple( PULL_SOUND_VOLUME_FADE, function()
+            snd:destroy()
+        end )
+    end
+
+    hookRunRemoteSafe( pearl, "LKL_DataPearl_SetBeingReadBy", false )
+
+    if ejectVel then
+        if type( ejectVel ) ~= "Vector" then
+            local strength = type( ejectVel ) == "number" and ejectVel or math.rand( EJECT_DEFAULT_STRENGTH_MIN, EJECT_DEFAULT_STRENGTH_MAX )
+
+            ejectVel = spreadVector( chip():getUp(), EJECT_DEFAULT_SPREAD, EJECT_DEFAULT_SPREAD )
+            ejectVel = ejectVel * strength
+        end
+
+        pearl:getPhysicsObject():setVelocity( ejectVel )
+        pearl.recentlyEjected = true
+
+        chip():emitSound( "npc/scanner/scanner_nearmiss1.wav", 75, 125, 0.5 )
+
+        local oldPearl = pearl
+
+        timer.simple( 0.5, function()
+            if isValid( oldPearl ) then
+                oldPearl.recentlyEjected = nil
+            end
+        end )
+    end
+
+    wire.ports.Pearl = game.getWorld()
+    wire.ports.HasAPearl = 0
+    wire.ports.PearlSettled = 0
+
+    pearl = nil
+    pearlSettled = false
+
+    setData()
+end
+
+local function setPowered( state )
+    if powered == state then return end
+
+    powered = state
+    wire.ports.Powered = powered and 1 or 0
+    updatePowerButton()
+
+    if not powered then
+        setLocked( false )
+        dropPearl()
+    end
+end
+
+local function setOwnerOnly( state )
+    if ownerOnly == state then return end
+
+    ownerOnly = state
+    wire.ports.OwnerOnly = ownerOnly and 1 or 0
+    updateOwnerOnlyButton()
+end
+
+local function wireInput( name, value )
+    if name == "DataStringIn" then
+        dataStringIn = value
+    elseif name == "DataCompressedIn" then
+        dataCompressedIn = value
+    elseif name == "ForceEject" then
+        if value ~= 0 then
+            dropPearl( true )
+        end
+    elseif name == "ForceEjectWithSpeed" then
+        if value ~= 0 then
+            dropPearl( value )
+        end
+    elseif name == "ForceEjectUpWithSpeed" then
+        if value ~= 0 then
+            dropPearl( chip():getUp() * value )
+        end
+    end
+end
+
+
+----- SETUP (Remote Hook Getters) -----
+
+hook.add( "remote", "LKL_DataPearlReader_GetHoldPos", function( _callingChip, _callingPly, hookName )
+    if hookName ~= "LKL_DataPearlReader_GetHoldPos" then return end
+
+    return chip():localToWorld( PEARL_HOLD_OFFSET_POS )
+end )
+
+hook.add( "remote", "LKL_DataPearlReader_IsLocked", function( _callingChip, _callingPly, hookName )
+    if hookName ~= "LKL_DataPearlReader_IsLocked" then return end
+
+    return locked
+end )
+
+hook.add( "remote", "LKL_DataPearlReader_IsPowered", function( _callingChip, _callingPly, hookName )
+    if hookName ~= "LKL_DataPearlReader_IsPowered" then return end
+
+    return powered
+end )
+
+hook.add( "remote", "LKL_DataPearlReader_IsOwnerOnly", function( _callingChip, _callingPly, hookName )
+    if hookName ~= "LKL_DataPearlReader_IsOwnerOnly" then return end
+
+    return ownerOnly
+end )
+
+
+----- SETUP (Remote Hook Setters) -----
+
+hook.add( "remote", "LKL_DataPearlReader_SetLocked", function( _callingChip, callingPly, hookName, state )
+    if callingPly ~= owner() then return end
+    if hookName ~= "LKL_DataPearlReader_SetLocked" then return end
+
+    setLocked( state )
+end )
+
+hook.add( "remote", "LKL_DataPearlReader_SetPowered", function( _callingChip, callingPly, hookName, state )
+    if callingPly ~= owner() then return end
+    if hookName ~= "LKL_DataPearlReader_SetPowered" then return end
+
+    setPowered( state )
+end )
+
+hook.add( "remote", "LKL_DataPearlReader_SetOwnerOnly", function( _callingChip, callingPly, hookName, state )
+    if callingPly ~= owner() then return end
+    if hookName ~= "LKL_DataPearlReader_SetOwnerOnly" then return end
+
+    setOwnerOnly( state )
+end )
+
+
+----- SETUP (Remote Hook Listeners) -----
+
+hook.add( "remote", "LKL_DataPearlReader_DataChanged", function( callingChip, _callingPly, hookName, info )
+    if hookName ~= "LKL_DataPearl_DataChanged" then return end
+    if callingChip ~= pearl then return end
+
+    setData( info.data, info.dataString, info.dataCompressed )
+end )
+
+hook.add( "remote", "LKL_DataPearlReader_ForceDrop", function( _callingChip, callingPly, hookName, pearlToDrop, ejectVel )
+    if callingPly ~= owner() then return end
+    if hookName ~= "LKL_DataPearlReader_ForceDrop" then return end
+    if pearlToDrop and pearlToDrop ~= pearl then return end
+
+    dropPearl( ejectVel )
+end )
+
+
+----- SETUP (Misc) -----
+
+hook.add( "input", "LKL_DataPearlReader_WireInput", wireInput )
+
+hook.add( "KeyPress", "LKL_DataPearlReader_PressButtons", function( ply, key )
+    if ownerOnly and ply ~= owner() then return end
+    if key ~= IN_KEY.USE then return end
+
+    local tr = ply:getEyeTrace()
+    local ent = tr.Entity
+
+    if not isValid( ent ) then return end -- Skip early if not looking at anything
+    if tr.StartPos:getDistance( tr.HitPos ) > READER_BUTTON_RANGE then return end
+
+    if ent == btnSet then
+        if not isValid( pearl ) then return end
+        if not pearlSettled then return end
+
+        if dataCompressedIn ~= "" then
+            hook.runRemote( pearl, "LKL_DataPearl_WriteData", dataCompressedIn, true )
+        else
+            hook.runRemote( pearl, "LKL_DataPearl_WriteData", dataStringIn, false )
+        end
+    elseif ent == btnLock then
+        setLocked( not locked )
+    elseif ent == btnPower then
+        setPowered( not powered )
+    elseif ent == btnOwnerOnly then
+        if ply ~= owner() then return end
+
+        setOwnerOnly( not ownerOnly )
+    end
+end )
+
+hook.add( "think", "LKL_DataPearlReader_PullInPearl", function()
+    if pearl == nil then return end
+
+    if not isValid( pearl ) then
+        if pullSound then
+            pullSound:destroy()
+            pullSound = nil
+        end
+
+        pearl = nil
+        pearlSettled = false
+        setLocked( false )
+        setData()
+
+        return
+    end
+
+    if locked then return end
+    if not powered then return end
+
+    local pearlHoldPos = chip():localToWorld( PEARL_HOLD_OFFSET_POS )
+    local pearlPos = pearl:getPos()
+    local toHoldPos = pearlHoldPos - pearlPos
+    local dist = toHoldPos:getLength()
+
+    if not pearlSettled or PEARL_CAN_UNSETTLE then
+        local pearlShouldSettle
+
+        if pearlSettled then
+            pearlShouldSettle = dist <= PEARL_UNSETTLE_RADIUS
+        else
+            pearlShouldSettle = dist <= PEARL_SETTLE_RADIUS and pearl:getVelocity():getLength() <= PEARL_SETTLE_SPEED_THRESHOLD
+        end
+
+        if pearlShouldSettle ~= pearlSettled then
+            pearlSettled = pearlShouldSettle
+
+            if pearlSettled then
+                local result = hook.runRemote( pearl, "LKL_DataPearl_ReadData" )[1][1]
+
+                setData( result.data, result.dataString, result.dataCompressed )
+
+                if pullSound then
+                    pullSound:setVolume( PULL_SOUND_VOLUME_SETTLED, PULL_SOUND_VOLUME_FADE )
+                end
+            else
+                setData()
+
+                if pullSound then
+                    pullSound:setVolume( PULL_SOUND_VOLUME, PULL_SOUND_VOLUME_FADE )
+                end
+            end
+
+            wire.ports.PearlSettled = pearlSettled and 1 or 0
+
+            if not isValid( pearl ) then return end -- In case wire is used to immediately drop the pearl here
+        end
+    end
+
+    if dist == 0 then return end
+
+    local physicsMult = timer.frametime() * pearl:getMass()
+    local pearlVelOpposite = -pearl:getVelocity()
+
+    pearl:applyForceCenter(
+        toHoldPos * PEARL_PULL_STRENGTH * physicsMult
+        + pearlVelOpposite * PEARL_PULL_DAMPENING * physicsMult
+    )
+
+    if pullSound then
+        local speed = pearlVelOpposite:getLength()
+        speed = math.clamp( speed, PULL_SOUND_PITCH_SPEED_MIN, PULL_SOUND_PITCH_SPEED_MAX )
+        local pitch = math.remap( speed, PULL_SOUND_PITCH_SPEED_MIN, PULL_SOUND_PITCH_SPEED_MAX, PULL_SOUND_PITCH_MIN, PULL_SOUND_PITCH_MAX )
+
+        pullSound:setPitch( pitch )
+    end
+end )
+
+
+timer.create( "LKL_DataPearlReader_SpawnButtons", 0.25, 0, function()
+    if not prop.canSpawn() then return end
+
+    if not btnSet then
+        pcall( function()
+            btnSet = prop.create( chip():localToWorld( Vector( 1.75, -1.5, 1.5 ) ), chip():localToWorldAngles( Angle( 60, -35, 0 ) ), "models/cheeze/buttons2/set_small.mdl", true )
+            btnSet:setParent( chip() )
+            btnSet:doNotDuplicate( true )
+        end )
+    elseif not btnLock then
+        pcall( function()
+            btnLock = prop.create( chip():localToWorld( Vector( 1.75, 1.5, 1.5 ) ), chip():localToWorldAngles( Angle( 60, 35, 0 ) ), "models/cheeze/buttons2/set_small.mdl", true )
+            btnLock:setParent( chip() )
+            btnLock:doNotDuplicate( true )
+            updateLockButton()
+        end )
+    elseif not btnPower then
+        pcall( function()
+            btnPower = prop.create( chip():localToWorld( Vector( 1.05, 0, 1.2 ) ), chip():localToWorldAngles( Angle( -25, -180, 0 ) ), "models/fasteroid/led_nano.mdl", true )
+            btnPower:setParent( chip() )
+            btnPower:doNotDuplicate( true )
+            btnPower:setMaterial( "model_color" )
+            updatePowerButton()
+        end )
+    elseif not btnOwnerOnly then
+        pcall( function()
+            btnOwnerOnly = prop.create( chip():localToWorld( Vector( 1.45, 0, 0.35 ) ), chip():localToWorldAngles( Angle( 70, 0, 0 ) ), "models/fasteroid/led_nano.mdl", true )
+            btnOwnerOnly:setParent( chip() )
+            btnOwnerOnly:doNotDuplicate( true )
+            btnOwnerOnly:setMaterial( "model_color" )
+            updateOwnerOnlyButton()
+        end )
+    end
+
+    if isValid( btnOwnerOnly ) then
+        ready = true
+
+        timer.remove( "LKL_DataPearlReader_SpawnButtons" )
+        hook.run( "LKL_DataPearlReader_Initialized" )
+    end
+end )
+
+timer.create( "LKL_PearlReader_DetectNearestPearl", 0.25, 0, function()
+    if not ready then return end
+    if locked then return end
+    if not powered then return end
+
+    local readerHoldPoss = {}
+    local otherReaders = find.byClass( "starfall_processor", function( ent )
+        if not isValid( ent ) then return false end
+        if ent == chip() then return false end
+        if ent:getOwner() ~= owner() then return false end
+        if ent:getChipName() ~= "Data Pearl Reader" then return false end
+
+        return true
+    end )
+
+    for _, otherChip in ipairs( otherReaders ) do
+        local resultsIsPowered = hookRunRemoteSafe( otherChip, "LKL_DataPearlReader_IsPowered" )
+
+        if resultsIsPowered and resultsIsPowered[1][1] then
+            local resultsGetHoldPos = hookRunRemoteSafe( otherChip, "LKL_DataPearlReader_GetHoldPos" )
+
+            if resultsGetHoldPos then
+                readerHoldPoss[otherChip] = resultsGetHoldPos[1][1]
+            end
+        end
+    end
+
+    local pearlHoldPos = chip():localToWorld( PEARL_HOLD_OFFSET_POS )
+    local nearestPearl = find.closest( find.byClass( "starfall_processor", function( ent )
+        if not isValid( ent ) then return false end
+        if ent:getOwner() ~= owner() then return false end
+        if ent:getChipName() ~= "Data Pearl" then return false end
+        if ent:isFrozen() then return false end
+        if ent.recentlyEjected then return false end
+
+        ent.beingReadBy = nil
+
+        local entPos = ent:getPos()
+        local dist = entPos:getDistance( pearlHoldPos )
+        if dist > PEARL_SEARCH_RADIUS then return false end
+
+        local resultsIsBeingGrabbed = hookRunRemoteSafe( ent, "LKL_DataPearl_IsBeingGrabbed" )
+        if not resultsIsBeingGrabbed then return false end -- Not a valid starfall instance
+        if resultsIsBeingGrabbed[1][1] then return false end
+
+        local resultsBeingReadBy = hookRunRemoteSafe( ent, "LKL_DataPearl_GetBeingReadBy" )
+        local beingReadBy = resultsBeingReadBy and resultsBeingReadBy[1][1]
+
+        ent.beingReadBy = beingReadBy
+
+        if isValid( beingReadBy ) and beingReadBy ~= chip() then
+            local otherHoldPos = readerHoldPoss[beingReadBy]
+            local otherDist = otherHoldPos and entPos:getDistance( otherHoldPos ) or math.huge
+            if otherDist <= dist then return false end
+
+            local resultsIsLocked = hookRunRemoteSafe( beingReadBy, "LKL_DataPearlReader_IsLocked" )
+            if resultsIsLocked and resultsIsLocked[1][1] then return false end
+        end
+
+        return true
+    end ), pearlHoldPos )
+
+    if nearestPearl == pearl then return end
+
+    if isValid( pearl ) then
+        dropPearl()
+    end
+
+    pearlSettled = false
+    pearl = nearestPearl
+
+    if isValid( pearl ) then
+        local otherReader = pearl.beingReadBy
+
+        if isValid( otherReader ) and otherReader ~= chip() then
+            hookRunRemoteSafe( otherReader, "LKL_DataPearlReader_ForceDrop", pearl )
+        end
+
+        if pullSound then
+            pullSound:destroy()
+            pullSound = nil
+        end
+
+        pcall( function()
+            pullSound = sound.create( pearl, "ambient/machines/wall_loop1.wav", true )
+            pullSound:play()
+            pullSound:setVolume( 0 )
+            pullSound:setVolume( PULL_SOUND_VOLUME, PULL_SOUND_VOLUME_FADE_START )
+        end )
+
+        pearl:enableGravity( false )
+        hookRunRemoteSafe( pearl, "LKL_DataPearl_SetBeingReadBy", true )
+
+        wire.ports.Pearl = pearl
+        wire.ports.HasAPearl = 1
+
+        timer.create( "LKL_DataPearlReader_MaintainNoGravity", 0.5, 0, function()
+            if isValid( pearl ) then
+                pearl:enableGravity( false )
+            else
+                timer.remove( "LKL_DataPearlReader_MaintainNoGravity" )
+            end
+        end )
+    end
+
+    setData()
+end )
+
+hook.add( "LKL_DataPearlReader_Initialized", "LKL_DataPearlReader_AutoLock", function()
+    local contraption = chip():getAllConstrained( { Weld = true } )
+
+    for _, ent in ipairs( contraption ) do
+        if ent:getOwner() ~= owner() then continue end
+        if ent:getClass() ~= "starfall_processor" then continue end
+        if ent:getChipName() ~= "Data Pearl" then continue end
+
+        constraint.breakType( ent, "Weld" )
+    end
+end )
+
+
+timer.simple( 1, function()
+    wireInput( "DataStringIn", wire.ports.DataStringIn )
+    wireInput( "DataCompressedIn", wire.ports.DataCompressedIn )
+end )

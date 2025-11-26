@@ -1,0 +1,396 @@
+--@name Poly Tools
+--@author legokidlogan
+--@client
+
+polyTools = polyTools or {}
+
+if polyTools.drawPoly then return end
+
+
+local mathRad = math.rad
+local mathCos = math.cos
+local mathSin = math.sin
+local mathASin = math.asin
+local mathPiHalf = math.pi / 2
+local tableInsert = table.insert
+local renderDrawPoly = render.drawPoly
+
+
+-- Poly drawing:
+
+--[[
+    - Similar to render.drawPoly(), but scales and positions relative to the given values.
+    - For the poly coords, 0 is far top/left, 1 is far bottom/right.
+    - http://thegrb93.github.io/StarfallEx/#Libraries.render.drawPoly
+--]]
+function polyTools.drawPoly( points, xPos, yPos, width, height )
+    local newPoints = {}
+
+    for i = 1, #points do
+        local point = points[i]
+        newPoints[i] = {
+            x = xPos + point.x * width,
+            y = yPos + point.y * height,
+            u = point.u,
+            v = point.v,
+        }
+    end
+
+    renderDrawPoly( newPoints )
+end
+
+-- Same as polyTools.drawPoly() but for drawing multiple separate polys in one call.
+function polyTools.drawPolys( polys, xPos, yPos, width, height )
+    local drawPoly = polyTools.drawPoly
+
+    for _, poly in ipairs( polys ) do
+        drawPoly( poly, xPos, yPos, width, height )
+    end
+end
+
+-- Same as polyTools.drawPoly() but without width/height scaling, which is faster.
+function polyTools.drawPolyUnscaled( points, xPos, yPos )
+    local newPoints = {}
+
+    for i = 1, #points do
+        local point = points[i]
+        newPoints[i] = {
+            x = xPos + point.x,
+            y = yPos + point.y,
+            u = point.u,
+            v = point.v,
+        }
+    end
+
+    renderDrawPoly( newPoints )
+end
+
+-- Same as polyTools.drawPolyUnscaled() but for drawing multiple separate polys in one call.
+function polyTools.drawPolysUnscaled( polys, xPos, yPos )
+    local drawPolyUnscaled = polyTools.drawPolyUnscaled
+
+    for _, poly in ipairs( polys ) do
+        drawPolyUnscaled( poly, xPos, yPos )
+    end
+end
+
+
+-- Poly transformations:
+
+--[[
+    - Applies a transformation onto a list of polys.
+    - ex: polyTools.polyApplyMultiple( polyTools.polyRotate, { poly1, poly2, poly3 }, 45 )
+--]]
+function polyTools.polyApplyMultiple( func, polys, ... )
+    local newPolys = {}
+
+    for _, poly in ipairs( polys ) do
+        tableInsert( newPolys, func( poly, ... ) )
+    end
+
+    return newPolys
+end
+
+function polyTools.polyFlipHorizontal( points )
+    local newPoints = {}
+
+    for _, point in ipairs( points ) do
+        tableInsert( newPoints, 1, {
+            x = 1 - point.x,
+            y = point.y,
+            u = point.u,
+            v = point.v,
+        } )
+    end
+
+    return newPoints
+end
+
+function polyTools.polyFlipVertical( points )
+    local newPoints = {}
+
+    for _, point in ipairs( points ) do
+        tableInsert( newPoints, 1, {
+            x = point.x,
+            y = 1 - point.y,
+            u = point.u,
+            v = point.v,
+        } )
+    end
+
+    return newPoints
+end
+
+-- Rotates clockwise around (0,0).
+function polyTools.polyRotate( points, degrees )
+    local newPoints = {}
+    local rad = mathRad( degrees )
+
+    for _, point in ipairs( points ) do
+        tableInsert( newPoints, {
+            x = point.x * mathCos( rad ) - point.y * mathSin( rad ),
+            y = point.x * mathSin( rad ) + point.y * mathCos( rad ),
+            u = point.u,
+            v = point.v,
+        } )
+    end
+
+    return newPoints
+end
+
+-- Rotates clockwise around the given point, or around the bounding box center of the poly if no point is given.
+function polyTools.polyRotateAround( points, degrees, xAnchor, yAnchor )
+    if not xAnchor and not yAnchor then
+        local xMin, xMax, yMin, yMax = math.huge, -math.huge, math.huge, -math.huge
+
+        for _, point in ipairs( points ) do
+            local x = point.x
+            local y = point.y
+
+            if x < xMin then xMin = x end
+            if x > xMax then xMax = x end
+            if y < yMin then yMin = y end
+            if y > yMax then yMax = y end
+        end
+
+        xAnchor = ( xMin + xMax ) / 2
+        yAnchor = ( yMin + yMax ) / 2
+    end
+
+    points = polyTools.polyTranslate( points, -xAnchor, -yAnchor )
+    points = polyTools.polyRotate( points, degrees )
+    points = polyTools.polyTranslate( points, xAnchor, yAnchor )
+
+    return points
+end
+
+function polyTools.polyTranslate( points, xOff, yOff )
+    local newPoints = {}
+
+    for _, point in ipairs( points ) do
+        tableInsert( newPoints, {
+            x = point.x + xOff,
+            y = point.y + yOff,
+            u = point.u,
+            v = point.v,
+        } )
+    end
+
+    return newPoints
+end
+
+-- Scales relative to the 0,0 origin.
+function polyTools.polyScale( points, xMult, yMult )
+    local newPoints = {}
+
+    yMult = yMult or xMult
+
+    for _, point in ipairs( points ) do
+        tableInsert( newPoints, {
+            x = point.x * xMult,
+            y = point.y * yMult,
+            u = point.u,
+            v = point.v,
+        } )
+    end
+
+    return newPoints
+end
+
+
+-- Poly creation:
+
+--[[
+    - Creates a poly for a filled semicircle.
+
+    x: (number)
+        - The x position of the center of the semicircle.
+    y: (number)
+        - The y position of the center of the semicircle.
+    radius: (number)
+        - The radius of the semicircle.
+    numSegments: (integer number)
+        - The number of segments to use to draw the semicircle.
+        - Larger numbers means smoother curves.
+    arcSizeDegrees: (optional) (number)
+        - The arc size of the semicircle, in degrees.
+        - Defaults to 360, a full circle.
+        - Expands counter-clockwise.
+    offsetDegrees: (optional) (number)
+        - The offset of the semicircle, in degrees.
+        - Defaults to 0, the far right edge.
+        - Moves counter-clockwise.
+--]]
+function polyTools.polyMakeCircleFilled( x, y, radius, numSegments, arcSizeDegrees, offsetDegrees )
+    local points = {}
+    local arcSizeRads = mathRad( arcSizeDegrees or 360 )
+    local offsetRads = mathRad( offsetDegrees or 0 )
+
+    points[1] = { x = x, y = y, u = 0.5, v = 0.5 }
+
+    for i = 0, numSegments do
+        local t = ( i / numSegments ) * -arcSizeRads - offsetRads
+        local tCos = mathCos( t )
+        local tSin = mathSin( t )
+
+        points[numSegments - i + 2] = { x = x + tCos * radius, y = y + tSin * radius, u = tCos / 2 + 0.5, v = tSin / 2 + 0.5 }
+    end
+
+    return points
+end
+
+--[[
+    - Creates a table of polys for a semicircular arc between two radii.
+    - Due to limits with poly drawing, some setups will require multiple polys to reach the desired shape.
+        - For the sake of consistency, this will always output a table of polys, even if only one is needed.
+
+    x: (number)
+        - The x position of the center of the arc.
+    y: (number)
+        - The y position of the center of the arc.
+    innerRadius: (number)
+        - The inner radius of the arc.
+    outerRadius: (number)
+        - The outer radius of the arc.
+    numSegments: (integer number)
+        - The number of segments to use to draw the arc.
+        - Larger numbers means smoother curves.
+    arcSizeDegrees: (optional) (number)
+        - The size of the arc, in degrees.
+        - Defaults to 360, a full circle.
+        - Expands counter-clockwise.
+    offsetDegrees: (optional) (number)
+        - The offset of the arc, in degrees.
+        - Defaults to 0, the far right edge.
+        - Moves counter-clockwise.
+--]]
+function polyTools.polyMakeCircleArcFilled( x, y, innerRadius, outerRadius, numSegments, arcSizeDegrees, offsetDegrees )
+    if innerRadius > outerRadius then
+        innerRadius, outerRadius = outerRadius, innerRadius
+    end
+
+    if innerRadius == 0 then return polyTools.polyMakeCircleFilled( x, y, outerRadius, numSegments, arcSizeDegrees, offsetDegrees ) end
+
+    local arcSizeRads = mathRad( arcSizeDegrees or 360 )
+    local offsetRads = mathRad( offsetDegrees or 0 )
+    local theta = mathASin( innerRadius / outerRadius )
+    local arcSizeLimit = 1 * ( mathPiHalf - theta ) -- 2 * ( 180 - 90 - theta )
+
+    if arcSizeRads <= arcSizeLimit then
+        return { polyMakeSingleArc( x, y, innerRadius, outerRadius, numSegments, arcSizeRads, offsetRads ) }
+    end
+
+    local polys = {}
+    local numPolys = 0
+    local arcSizeRemaining = arcSizeRads
+    local offsetAccum = offsetRads
+    local segmentsPerUnitArcSize = numSegments / arcSizeRads
+
+    while arcSizeRemaining > 0 do
+        local chunkArcSize = math.min( arcSizeRemaining, arcSizeLimit )
+        local chunkSegments = math.ceil( chunkArcSize * segmentsPerUnitArcSize )
+
+        numPolys = numPolys + 1
+
+        polys[numPolys] = polyMakeSingleArc( x, y, innerRadius, outerRadius, chunkSegments, chunkArcSize, offsetAccum )
+
+        arcSizeRemaining = arcSizeRemaining - chunkArcSize
+        offsetAccum = offsetAccum + chunkArcSize
+    end
+
+    return polys
+end
+
+--[[
+    - Creates polys for the left and right halves of a hollow diamond shape.
+    - Returns the two polys as separate args.
+        - If you want them as a list, just surround the function call with {}.
+
+    x: (number)
+        - The x position of the center of the diamond.
+    y: (number)
+        - The y position of the center of the diamond.
+    width: (number)
+        - The width of the diamond.
+    height: (number)
+        - The height of the diamond.
+    thickness: (number 0-1)
+        - A fraction for how much to fill in the diamond by.
+--]]
+function polyTools.polyMakeDiamondLR( x, y, width, height, thickness )
+    local w = width * 0.5
+    local h = height * 0.5
+    local tw = thickness * w
+    local th = thickness * h
+
+    local polyLeft = {
+        { x = x - w, y = y },
+        { x = x, y = y - h },
+        { x = x, y = y - h + th },
+        { x = x - w + tw, y = y },
+        { x = x, y = y + h - th },
+        { x = x, y = y + h },
+    }
+
+    local polyRight = {
+        { x = x + w, y = y },
+        { x = x, y = y + h },
+        { x = x, y = y + h - th },
+        { x = x + w - tw, y = y },
+        { x = x, y = y - h + th },
+        { x = x, y = y - h },
+    }
+
+    return polyLeft, polyRight
+end
+
+--[[
+    - Same as polyTools.polyMakeDiamondLR(), but for the top and bottom halves.
+--]]
+function polyTools.polyMakeDiamondTB( x, y, width, height, thickness )
+    local w = width * 0.5
+    local h = height * 0.5
+    local tw = thickness * w
+    local th = thickness * h
+
+    local polyTop = {
+        { x = x, y = y - h },
+        { x = x + w, y = y },
+        { x = x + w - tw, y = y },
+        { x = x, y = y - h + th },
+        { x = x - w + tw, y = y },
+        { x = x - w, y = y },
+    }
+
+    local polyBottom = {
+        { x = x, y = y + h },
+        { x = x - w, y = y },
+        { x = x - w + tw, y = y },
+        { x = x, y = y + h - th },
+        { x = x + w - tw, y = y },
+        { x = x + w, y = y },
+    }
+
+    return polyTop, polyBottom
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+polyMakeSingleArc = function( x, y, innerRadius, outerRadius, numSegments, arcSize, offset )
+    local points = {}
+
+    for i = 0, numSegments do
+        local t = ( i / numSegments ) * -arcSize - offset
+        local tCos = mathCos( t )
+        local tSin = mathSin( t )
+
+        local u = tCos / 2 + 0.5
+        local v = tSin / 2 + 0.5
+
+        points[numSegments - i + 1] = { x = x + tCos * outerRadius, y = y + tSin * outerRadius, u = u, v = v }
+        points[numSegments + i + 2] = { x = x + tCos * innerRadius, y = y + tSin * innerRadius, u = u, v = v }
+    end
+
+    return points
+end

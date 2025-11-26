@@ -1,0 +1,1184 @@
+--@name Map Data
+--@author legokidlogan
+--@shared
+--@include lkl/global_data_manager.txt
+--@include lkl/gcolors.txt
+--@include lkl/safe_stream.txt
+
+libMapData = libMapData or {}
+
+if libMapData._alreadyRequired then return end
+libMapData._alreadyRequired = true
+
+
+-- CONFIG:
+libMapData.OWNER_ONLY = libMapData.OWNER_ONLY or false -- If true, then the owner will be the only client to receive map data.
+libMapData.FORCE_REGENERATE = libMapData.FORCE_REGENERATE or false -- If true, then this version's map data will be cleared and regenerated.
+libMapData.HIDE_PROGRESS_PRINTS = libMapData.HIDE_PROGRESS_PRINTS or false -- If true, then while generating new data, per-step progress prints will be hidden.
+libMapData.PERF_LIMIT = libMapData.PERF_LIMIT or 0.4 -- Perf limit.
+-- END CONFIG
+
+
+require( "lkl/gcolors.txt" )
+require( "lkl/safe_stream.txt" )
+
+local data = nil
+local dataIsReady = false
+local versionID = "v3"
+local hasSentReadyHook = false
+
+
+----- GLOBAL FUNCTIONS -----
+
+--[[
+    - Whether or not the map's data has been loaded/generated yet and is ready to be used.
+    - Upon data becoming ready, server and client will run the LKL_MapData_DataReady hook.
+--]]
+function libMapData.isDataReady()
+    return dataIsReady
+end
+
+--[[
+    - Returns the map's data, or nil if it isn't ready yet.
+    - This returns by reference, so DO NOT MODIFY IT.
+    - Data is of the following format: {
+        Center = VECTOR,
+        MinBounds = VECTOR,
+        MaxBounds = VECTOR,
+        SpawnPoints = {
+            [1] = {
+                Pos = VECTOR,
+                Ang = ANGLE,
+            },
+            ...
+        },
+        PlayableRegion = {
+            Center = VECTOR,
+            MinBounds = VECTOR,
+            MaxBounds = VECTOR,
+        },
+        Skybox = false or { -- false if no 3D skybox
+            Center = VECTOR,
+            MinBounds = VECTOR,
+            MaxBounds = VECTOR,
+            Origin = VECTOR, -- The origin of the skybox. Equivalent to the world's origin (0,0,0) if no 3D skybox.
+            Scale = NUMBER, -- The scale of the skybox compared to the world.
+        },
+    }
+--]]
+function libMapData.getData()
+    if not dataIsReady then return end
+
+    return data
+end
+
+function libMapData.getVersionID()
+    return versionID
+end
+
+--[[
+    - Returns whether or not the given position is within the full map's bounds.
+    - Returns nil if map data is not ready.
+    - Note that this uses the aabb bounds, so a point in the empty void might still yield true.
+        - See Vector:isInWorld() for checking if a point is not in the void.
+--]]
+function libMapData.isInMapBounds( pos )
+    if not dataIsReady then return end
+
+    -- Cache values and redefine the function once to improve performance.
+    local minBounds = data.MinBounds
+    local maxBounds = data.MaxBounds
+
+    -- The true function definition.
+    libMapData.isInMapBounds = function( pos_ )
+        return pos_:withinAABox( minBounds, maxBounds )
+    end
+
+    return libMapData.isInMapBounds( pos )
+end
+
+--[[
+    - Returns whether or not the given position is within the bound of the playable region.
+    - Returns nil if map data is not ready.
+    - Note that this uses the aabb bounds, so a point in the empty void might still yield true.
+        - See Vector:isInWorld() for checking if a point is not in the void.
+--]]
+function libMapData.isInPlayableRegionBounds( pos )
+    if not dataIsReady then return end
+
+    -- Cache values and redefine the function once to improve performance.
+    local minBounds = data.PlayableRegion.MinBounds
+    local maxBounds = data.PlayableRegion.MaxBounds
+
+    -- The true function definition.
+    libMapData.isInPlayableRegionBounds = function( pos_ )
+        return pos_:withinAABox( minBounds, maxBounds )
+    end
+
+    return libMapData.isInPlayableRegionBounds( pos )
+end
+
+--[[
+    - Returns whether or not the given position is within the bound of the skybox.
+    - Returns nil if map data is not ready.
+    - Returns false if the map has no 3D skybox.
+    - Note that this uses the aabb bounds, so a point in the empty void might still yield true.
+        - See Vector:isInWorld() for checking if a point is not in the void.
+--]]
+function libMapData.isInSkyboxBounds( pos )
+    if not dataIsReady then return end
+
+    -- No skybox, redefine to always return false.
+    if not data.Skybox then
+        libMapData.isInSkyboxBounds = function() return false end
+
+        return false
+    end
+
+    -- Cache values and redefine the function once to improve performance.
+    local minBounds = data.Skybox.MinBounds
+    local maxBounds = data.Skybox.MaxBounds
+
+    -- The true function definition.
+    libMapData.isInSkyboxBounds = function( pos_ )
+        return pos_:withinAABox( minBounds, maxBounds )
+    end
+
+    return libMapData.isInSkyboxBounds( pos )
+end
+
+--[[
+    - Converts a position in the world to a position in the skybox.
+    - Returns nil if map data is not ready.
+    - Returns false if the map has no 3D skybox.
+--]]
+function libMapData.worldPosToSkyPos( pos )
+    if not dataIsReady then return end
+
+    -- No skybox, redefine to always return false.
+    if not data.Skybox then
+        libMapData.worldPosToSkyPos = function() return false end
+
+        return false
+    end
+
+    -- Cache values and redefine the function once to improve performance.
+    local skyOrigin = data.Skybox.Origin
+    local skyScale = data.Skybox.Scale
+
+    -- The true function definition.
+    libMapData.worldPosToSkyPos = function( pos_ )
+        return pos_ * skyScale + skyOrigin
+    end
+
+    return libMapData.worldPosToSkyPos( pos )
+end
+
+--[[
+    - Converts a position in the skybox to a position in the world.
+    - Returns nil if map data is not ready.
+    - Returns false if the map has no 3D skybox.
+--]]
+function libMapData.skyPosToWorldPos( pos )
+    if not dataIsReady then return end
+
+    -- No skybox, redefine to always return false.
+    if not data.Skybox then
+        libMapData.skyPosToWorldPos = function() return false end
+
+        return false
+    end
+
+    -- Cache values and redefine the function once to improve performance.
+    local skyOrigin = data.Skybox.Origin
+    local skyScale = data.Skybox.Scale
+
+    -- The true function definition.
+    libMapData.skyPosToWorldPos = function( pos_ )
+        return ( pos_ - skyOrigin ) / skyScale
+    end
+
+    return libMapData.skyPosToWorldPos( pos )
+end
+
+
+----- NON-OWNER DATA RECEIVING -----
+
+if CLIENT and player() ~= owner() then
+    net.receive( "LKL_MapData_SendData_NonOwner", function()
+        safeStream.read( function( str )
+            data = json.decode( str )
+            dataIsReady = true
+
+            hook.run( "LKL_MapData_DataReady" )
+        end )
+    end )
+end
+
+
+if CLIENT and player() ~= owner() then return end
+
+
+----- DATA STORAGE -----
+
+if CLIENT then
+    local dataFilePath = "lkl/map_data/" .. string.lower( game.getMap() ) .. ".txt"
+
+
+    local function requestDataGeneration()
+        net.start( "LKL_MapData_GenerateData" )
+        net.send()
+    end
+
+    local function tryLoadData()
+        if not file.exists( dataFilePath ) then
+            requestDataGeneration()
+
+            return
+        end
+
+        local fileData = json.decode( file.read( dataFilePath ) )
+        fileData = fileData[versionID]
+
+        if fileData == nil then
+            requestDataGeneration()
+
+            return
+        end
+
+        data = fileData
+        dataIsReady = true
+
+        -- Check to see if the server actually needs the data, in case the owner restarted the chip clientside.
+        net.start( "LKL_MapData_DoesServerNeedData" )
+        net.send()
+
+        if not hasSentReadyHook then
+            hasSentReadyHook = true
+            hook.run( "LKL_MapData_DataReady" )
+        end
+    end
+
+    -- Only works on startup before tryLoadData() is called.
+    -- The generator code is currently not designed to handle resetting itself.
+    local function clearVersionData()
+        if not file.exists( dataFilePath ) then return end
+
+        local fileData = json.decode( file.read( dataFilePath ) )
+        if fileData[versionID] == nil then return end -- Already cleared
+
+        fileData[versionID] = nil
+
+        file.write( dataFilePath, json.encode( fileData ) )
+    end
+
+
+    net.receive( "LKL_MapData_DoesServerNeedData_Response", function()
+        if not net.readBool() then return end -- The server already has the data.
+
+        net.start( "LKL_MapData_SendData" )
+        safeStream.write( json.encode( data ), false )
+        net.send()
+    end )
+
+    net.receive( "LKL_MapData_SendData", function()
+        safeStream.read( function( str )
+            data = json.decode( str )
+            dataIsReady = true
+
+            local fileData
+
+            if file.exists( dataFilePath ) then
+                fileData = json.decode( file.read( dataFilePath ) )
+            else
+                fileData = {}
+            end
+
+            fileData[versionID] = data
+            file.write( dataFilePath, json.encode( fileData ) )
+
+            print(
+                c_white, "[MapData] ",
+                c_pale_green, "Newly-generated data has been saved!"
+            )
+
+            if not hasSentReadyHook then
+                hasSentReadyHook = true
+                hook.run( "LKL_MapData_DataReady" )
+            end
+        end )
+    end )
+
+    net.receive( "LKL_MapData_TryLoadData", function()
+        tryLoadData()
+    end )
+
+
+    do
+        local folder = string.getPathFromFilename( dataFilePath )
+        file.createDir( folder )
+
+        if libMapData.FORCE_REGENERATE then
+            clearVersionData()
+        end
+
+        timer.simple( 0.1, tryLoadData ) -- Load after a delay so other scripts can add hook listeners first.
+    end
+end
+
+
+----- DATA GENERATION -----
+
+local function printIf( shouldPrint, ... )
+    if not shouldPrint then return end
+
+    print( ... )
+end
+
+
+if CLIENT then
+    net.receive( "LKL_MapData_DataGen_RequestSkyboxScale", function()
+        local alreadyHadHUD = render.isHUDActive()
+
+        if not alreadyHadHUD then
+            printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+                c_white, "[MapData] ",
+                c_pend_orange, "    Getting skybox scale...",
+                c_white, " (HUD will temporarily be enabled)"
+            )
+
+            enableHud( player(), true )
+        else
+            printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+                c_white, "[MapData] ",
+                c_pend_orange, "    Getting skybox scale..."
+            )
+
+        end
+
+        hook.add( "setupskyboxfog", "LKL_MapData_DataGen_GetSkyboxScale", function( scale )
+            hook.remove( "setupskyboxfog", "LKL_MapData_DataGen_GetSkyboxScale" )
+            timer.remove( "LKL_MapData_DataGen_GetSkyboxScale_Timeout" )
+
+            if not alreadyHadHUD then
+                enableHud( player(), false )
+            end
+
+            net.start( "LKL_MapData_DataGen_DefineSkyboxScale" )
+            net.writeFloat( scale )
+            net.writeBool( true )
+            net.send()
+        end )
+
+        timer.create( "LKL_MapData_DataGen_GetSkyboxScale_Timeout", 1, 1, function()
+            hook.remove( "setupskyboxfog", "LKL_MapData_DataGen_GetSkyboxScale" )
+
+            if not alreadyHadHUD then
+                enableHud( player(), true )
+            end
+
+            net.start( "LKL_MapData_DataGen_DefineSkyboxScale" )
+            net.writeFloat( 0.0625 ) -- 1 / 16
+            net.writeBool( false )
+            net.send()
+        end )
+    end )
+end
+
+
+if CLIENT then return end
+
+
+local finishGeneratingData
+
+
+local TRACE_LENGTH = 50000
+local TRACE_COLLISION_GROUP = COLLISION_GROUP.DEBRIS
+local TRACE_MASK = MASK.SOLID_BRUSHONLY
+local BOUNCE_OFFSETS = {
+    Vector( 1, 1, 1 ):getNormalized() * TRACE_LENGTH,
+    Vector( 1, 1, -1 ):getNormalized() * TRACE_LENGTH,
+    Vector( 1, -1, 1 ):getNormalized() * TRACE_LENGTH,
+    Vector( 1, -1, -1 ):getNormalized() * TRACE_LENGTH,
+    Vector( -1, 1, 1 ):getNormalized() * TRACE_LENGTH,
+    Vector( -1, 1, -1 ):getNormalized() * TRACE_LENGTH,
+    Vector( -1, -1, 1 ):getNormalized() * TRACE_LENGTH,
+    Vector( -1, -1, -1 ):getNormalized() * TRACE_LENGTH,
+}
+
+local iterationInterval = 0.1
+
+local playableRegionBouncesPerChain = 400
+
+local skyboxBouncesPerChain = 20
+
+local mapMinX = math.huge
+local mapMinY = math.huge
+local mapMinZ = math.huge
+local mapMaxX = -math.huge
+local mapMaxY = -math.huge
+local mapMaxZ = -math.huge
+local mapBrushSurfaces = nil
+local mapBrushSurfaceInd = 1
+local mapBrushSurfaceCount = 0
+local gettingMapBounds = false
+
+local playableRegionMinX = math.huge
+local playableRegionMinY = math.huge
+local playableRegionMinZ = math.huge
+local playableRegionMaxX = -math.huge
+local playableRegionMaxY = -math.huge
+local playableRegionMaxZ = -math.huge
+local tracingPlayableRegion = false
+local playableRegionBouncesRemaining = nil
+local playableRegionBounceOrigins = {}
+local playableRegionBounceOffsets = {}
+local playableRegionBounceLastPos = nil
+local playableRegionBounceLastOffset = nil
+
+local skyboxMinX = math.huge
+local skyboxMinY = math.huge
+local skyboxMinZ = math.huge
+local skyboxMaxX = -math.huge
+local skyboxMaxY = -math.huge
+local skyboxMaxZ = -math.huge
+local tracingSkybox = false
+local skyboxBouncesRemaining = nil
+local skyboxBounceOrigins = {}
+local skyboxBounceOffsets = {}
+local skyboxBounceLastPos = nil
+local skyboxBounceLastOffset = nil
+local skyboxOrigin = nil
+local skyboxScale = nil
+
+local tableInsert = table.insert
+local tableRemove = table.remove
+local traceLine = trace.line
+
+
+local function getPerfLimit()
+    local perfLimit = cpuMax() * libMapData.PERF_LIMIT
+    local totalPerf = cpuTotalAverage()
+    if totalPerf >= perfLimit then return end
+
+    local otherPerf = totalPerf - cpuAverage()
+    perfLimit = perfLimit - otherPerf
+
+    return perfLimit
+end
+
+local function mapTraceSingleBounce( pos, offset )
+    local tr = traceLine( pos, pos + offset, nil, TRACE_COLLISION_GROUP, TRACE_MASK, false )
+    if tr.StartSolid then return false end
+
+    if tr.Hit then
+        local newOffset = -offset:rotateAroundAxis( tr.HitNormal, 180 )
+
+        return tr.HitPos, newOffset
+    end
+
+    return tr.HitPos, offset
+end
+
+local function expandPlayableRegion( pos )
+    local x = pos[1]
+    local y = pos[2]
+    local z = pos[3]
+
+    if x < playableRegionMinX then
+        playableRegionMinX = x
+    elseif x > playableRegionMaxX then
+        playableRegionMaxX = x
+    end
+
+    if y < playableRegionMinY then
+        playableRegionMinY = y
+    elseif y > playableRegionMaxY then
+        playableRegionMaxY = y
+    end
+
+    if z < playableRegionMinZ then
+        playableRegionMinZ = z
+    elseif z > playableRegionMaxZ then
+        playableRegionMaxZ = z
+    end
+end
+
+local function expandSkybox( pos )
+    local x = pos[1]
+    local y = pos[2]
+    local z = pos[3]
+
+    if x < skyboxMinX then
+        skyboxMinX = x
+    elseif x > skyboxMaxX then
+        skyboxMaxX = x
+    end
+
+    if y < skyboxMinY then
+        skyboxMinY = y
+    elseif y > skyboxMaxY then
+        skyboxMaxY = y
+    end
+
+    if z < skyboxMinZ then
+        skyboxMinZ = z
+    elseif z > skyboxMaxZ then
+        skyboxMaxZ = z
+    end
+end
+
+local function addOriginToPlayableRegionBounces( origin )
+    if not origin:isInWorld() then return end
+
+    for _, offset in ipairs( BOUNCE_OFFSETS ) do
+        tableInsert( playableRegionBounceOrigins, origin )
+        tableInsert( playableRegionBounceOffsets, offset )
+    end
+end
+
+local function addOriginToSkyboxBounces( origin )
+    if not origin:isInWorld() then return end
+
+    for _, offset in ipairs( BOUNCE_OFFSETS ) do
+        tableInsert( skyboxBounceOrigins, origin )
+        tableInsert( skyboxBounceOffsets, offset )
+    end
+end
+
+local function startGettingMapBounds()
+    printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+        c_white, "[MapData] ",
+        c_pend_orange, "  Getting map bounds..."
+    )
+
+    gettingMapBounds = true
+    mapBrushSurfaces = game.getWorld():getBrushSurfaces() -- TODO: Verify whether this starts at 0 or 1
+    mapBrushSurfaceInd = 1
+    mapBrushSurfaceCount = #mapBrushSurfaces
+end
+
+local function startGettingPlayableRegion()
+    if not tracingPlayableRegion then
+        printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+            c_white, "[MapData] ",
+            c_pend_orange, "  Tracing playable region..."
+        )
+    end
+
+    tracingPlayableRegion = true
+    playableRegionBouncesRemaining = playableRegionBouncesPerChain
+    playableRegionBounceLastPos = tableRemove( playableRegionBounceOrigins )
+    playableRegionBounceLastOffset = tableRemove( playableRegionBounceOffsets )
+
+    if not playableRegionBounceLastPos then
+        error( "Map has no info_player_start or env_soundscape* entities!" )
+    end
+end
+
+local function findSuitableSkyboxTraceOrigin()
+    for i = 1, 10 do
+        local adjustedTraceOrigin = skyboxOrigin + Vector( 20 * i, 0, 0 )
+        if adjustedTraceOrigin:isInWorld() then
+            return addOriginToSkyboxBounces( adjustedTraceOrigin )
+        end
+
+        adjustedTraceOrigin = skyboxOrigin + Vector( -20 * i, 0, 0 )
+        if adjustedTraceOrigin:isInWorld() then
+            return addOriginToSkyboxBounces( adjustedTraceOrigin )
+        end
+
+        adjustedTraceOrigin = skyboxOrigin + Vector( 0, 20 * i, 0 )
+        if adjustedTraceOrigin:isInWorld() then
+            return addOriginToSkyboxBounces( adjustedTraceOrigin )
+        end
+
+        adjustedTraceOrigin = skyboxOrigin + Vector( 0, -20 * i, 0 )
+        if adjustedTraceOrigin:isInWorld() then
+            return addOriginToSkyboxBounces( adjustedTraceOrigin )
+        end
+
+        adjustedTraceOrigin = skyboxOrigin + Vector( 0, 0, 20 * i )
+        if adjustedTraceOrigin:isInWorld() then
+            return addOriginToSkyboxBounces( adjustedTraceOrigin )
+        end
+
+        adjustedTraceOrigin = skyboxOrigin + Vector( 0, 0, -20 * i )
+        if adjustedTraceOrigin:isInWorld() then
+            return addOriginToSkyboxBounces( adjustedTraceOrigin )
+        end
+    end
+
+    error( "Couldn't find a suitable trace origin for the skybox!" )
+end
+
+local function startGettingSkybox()
+    if not tracingSkybox then
+        printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+            c_white, "[MapData] ",
+            c_pend_orange, "  Getting skybox info..."
+        )
+    end
+
+    local skyCam = find.byClass( "sky_camera" )[1]
+    skyCam = isValid( skyCam ) and skyCam
+
+    if skyCam then
+        skyboxOrigin = skyCam:getPos()
+
+        if skyboxOrigin:isInWorld() then
+            addOriginToSkyboxBounces( skyboxOrigin )
+        else
+            findSuitableSkyboxTraceOrigin()
+        end
+    end
+
+    if not skyCam or #skyboxBounceOrigins == 0 then
+        local indent = libMapData.HIDE_PROGRESS_PRINTS and
+            "  " or
+            "    "
+
+        print(
+            c_white, "[MapData] ",
+            alert_red, indent .. "Couldn't find a ",
+            c_yellow, "sky_camera ",
+            alert_red, "entity! This map likely has no skybox."
+        )
+
+        data.Skybox = false
+        startGettingPlayableRegion()
+
+        return
+    end
+
+    net.start( "LKL_MapData_DataGen_RequestSkyboxScale" )
+    net.send( owner() )
+end
+
+
+net.receive( "LKL_MapData_DataGen_DefineSkyboxScale", function( _, ply )
+    if ply ~= owner() then return end
+
+    skyboxScale = net.readFloat()
+
+    printIf( not libMapData.HIDE_PROGRESS_PRINTS and not net.readBool(),
+        c_white, "[MapData] ",
+        c_alert_red, "    Map fog prevented skybox scale detection! ",
+        c_white, "Using default scale of ",
+        c_yellow, "1/16"
+    )
+
+    printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+        c_white, "[MapData] ",
+        c_pend_orange, "    Tracing skybox..."
+    )
+
+    tracingSkybox = true
+    skyboxBouncesRemaining = skyboxBouncesPerChain
+    skyboxBounceLastPos = tableRemove( skyboxBounceOrigins )
+    skyboxBounceLastOffset = tableRemove( skyboxBounceOffsets )
+end )
+
+
+timer.create( "LKL_MapData_DataGen_GetMapBounds", iterationInterval, 0, function()
+    if not gettingMapBounds then return end
+
+    local perfLimit = getPerfLimit()
+    if not perfLimit then return end
+
+    while mapBrushSurfaceInd <= mapBrushSurfaceCount and cpuAverage() < perfLimit do
+        local verts = mapBrushSurfaces[mapBrushSurfaceInd]:getVertices()
+
+        for _, vert in ipairs( verts ) do
+            local x = vert[1]
+            local y = vert[2]
+            local z = vert[3]
+
+            if x < mapMinX then
+                mapMinX = x
+            elseif x > mapMaxX then
+                mapMaxX = x
+            end
+
+            if y < mapMinY then
+                mapMinY = y
+            elseif y > mapMaxY then
+                mapMaxY = y
+            end
+
+            if z < mapMinZ then
+                mapMinZ = z
+            elseif z > mapMaxZ then
+                mapMaxZ = z
+            end
+        end
+
+        mapBrushSurfaceInd = mapBrushSurfaceInd + 1
+    end
+
+    if mapBrushSurfaceInd > mapBrushSurfaceCount then
+        local mapMin = Vector( mapMinX, mapMinY, mapMinZ )
+        local mapMax = Vector( mapMaxX, mapMaxY, mapMaxZ )
+
+        data.Center = ( mapMin + mapMax ) / 2
+        data.MinBounds = mapMin
+        data.MaxBounds = mapMax
+
+        gettingMapBounds = false
+        timer.remove( "LKL_MapData_DataGen_GetMapBounds" )
+        finishGeneratingData()
+    end
+end )
+
+timer.create( "LKL_MapData_DataGen_TracePlayableRegion", iterationInterval, 0, function()
+    if not tracingPlayableRegion then return end
+
+    local perfLimit = getPerfLimit()
+    if not perfLimit then return end
+
+    while cpuAverage() < perfLimit do
+        for _ = 1, 10 do -- Trace more times per each perf check, improving speed but increasing risk of breaching perf
+            if playableRegionBouncesRemaining <= 0 then
+                playableRegionBouncesRemaining = playableRegionBouncesPerChain
+                playableRegionBounceLastPos = tableRemove( playableRegionBounceOrigins )
+                playableRegionBounceLastOffset = tableRemove( playableRegionBounceOffsets )
+
+                if not playableRegionBounceLastPos then
+                    local playableRegionMin = Vector( playableRegionMinX, playableRegionMinY, playableRegionMinZ )
+                    local playableRegionMax = Vector( playableRegionMaxX, playableRegionMaxY, playableRegionMaxZ )
+
+                    data.PlayableRegion = {
+                        Center = ( playableRegionMin + playableRegionMax ) / 2,
+                        MinBounds = playableRegionMin,
+                        MaxBounds = playableRegionMax,
+                    }
+
+                    tracingPlayableRegion = false
+                    timer.remove( "LKL_MapData_DataGen_TracePlayableRegion" )
+                    startGettingMapBounds()
+
+                    return
+                end
+            end
+
+            local nextPos, nextOffset = mapTraceSingleBounce( playableRegionBounceLastPos, playableRegionBounceLastOffset )
+            if not nextPos then
+                playableRegionBouncesRemaining = 0
+
+                break
+            end
+
+            expandPlayableRegion( nextPos )
+            playableRegionBounceLastPos = nextPos
+            playableRegionBounceLastOffset = nextOffset
+            playableRegionBouncesRemaining = playableRegionBouncesRemaining - 1
+        end
+    end
+end )
+
+timer.create( "LKL_MapData_DataGen_TraceSkybox", iterationInterval, 0, function()
+    if not tracingSkybox then return end
+
+    local perfLimit = getPerfLimit()
+    if not perfLimit then return end
+
+    while cpuAverage() < perfLimit do
+        for _ = 1, 10 do -- Trace more times per each perf check, improving speed but increasing risk of breaching perf
+            if skyboxBouncesRemaining == 0 then
+                skyboxBouncesRemaining = skyboxBouncesPerChain
+                skyboxBounceLastPos = tableRemove( skyboxBounceOrigins )
+                skyboxBounceLastOffset = tableRemove( skyboxBounceOffsets )
+
+                if not skyboxBounceLastPos then
+                    local skyboxMin = Vector( skyboxMinX, skyboxMinY, skyboxMinZ )
+                    local skyboxMax = Vector( skyboxMaxX, skyboxMaxY, skyboxMaxZ )
+
+                    data.Skybox = {
+                        Center = ( skyboxMin + skyboxMax ) / 2,
+                        MinBounds = skyboxMin,
+                        MaxBounds = skyboxMax,
+                        Origin = skyboxOrigin,
+                        Scale = skyboxScale,
+                    }
+
+                    tracingSkybox = false
+                    timer.remove( "LKL_MapData_DataGen_TraceSkybox" )
+                    startGettingPlayableRegion()
+
+                    return
+                end
+            end
+
+            local nextPos, nextOffset = mapTraceSingleBounce( skyboxBounceLastPos, skyboxBounceLastOffset )
+            if not nextPos then
+                skyboxBouncesRemaining = 0
+
+                break
+            end
+
+            expandSkybox( nextPos )
+            skyboxBounceLastPos = nextPos
+            skyboxBounceLastOffset = nextOffset
+            skyboxBouncesRemaining = skyboxBouncesRemaining - 1
+        end
+    end
+end )
+
+
+local function generateMapData()
+    print(
+        c_white, "[MapData] ",
+        c_pend_orange, "Generating ",
+        c_yellow, tostring( versionID ),
+        c_pend_orange, " map data..."
+    )
+
+    data = {}
+
+    -- Find spawn points
+    printIf( not libMapData.HIDE_PROGRESS_PRINTS,
+        c_white, "[MapData] ",
+        c_pend_orange, "  Getting spawn points..."
+    )
+
+    local spawnPoints = find.byClass( "info_player_start" )
+    local spawnPointDatas = {}
+
+    data.SpawnPoints = spawnPointDatas
+
+    for _, spawnPoint in ipairs( spawnPoints ) do
+        local pos = spawnPoint:getPos()
+        local ang = spawnPoint:getAngles()
+
+        expandPlayableRegion( pos )
+        addOriginToPlayableRegionBounces( pos )
+
+        tableInsert( spawnPointDatas, {
+            Pos = pos,
+            Ang = ang,
+        } )
+    end
+
+    -- Use a subset of the soundscape entities to get more bounce origins, in case the spawn points are in a separate, teleport-only area.
+    local soundscapeEnts = find.byClass( "env_soundscape*" )
+
+    for i = 1, math.min( #soundscapeEnts, 10 ) do
+        local soundscapeEnt = soundscapeEnts[i]
+        local pos = soundscapeEnt:getPos()
+
+        expandPlayableRegion( pos )
+        addOriginToPlayableRegionBounces( pos )
+    end
+
+    -- Subset of info_teleport_destination entities.
+    local teleportDestEnts = find.byClass( "info_teleport_destination" )
+
+    for i = 1, math.min( #teleportDestEnts, 10 ) do
+        local teleportDestEnt = teleportDestEnts[i]
+        local pos = teleportDestEnt:getPos()
+
+        expandPlayableRegion( pos )
+        addOriginToPlayableRegionBounces( pos )
+    end
+
+    startGettingSkybox()
+end
+
+
+----- DATA MANAGEMENT -----
+
+require( "lkl/global_data_manager.txt" )
+
+local generatingData = false
+local waitingToGenerateData = false
+local generationStartTime = nil
+local newPlayerLookup = {}
+
+
+local function getWaitingChips()
+    local results = hookRunRemoteByOwner( owner(), "LKL_MapData_IsWaitingToGenerateData" )
+    local chips = {}
+
+    for _, resultArgs in ipairs( results ) do
+        local chipEnt = resultArgs.Chip
+
+        if chipEnt ~= chip() and resultArgs[1] == true then
+            table.insert( chips, chipEnt )
+        end
+    end
+
+    return chips
+end
+
+local function isOtherChipGenerating( otherChip )
+    local generatingChipInfo = GDM.OwnerData.MapData.GeneratingChipInfo
+    if not generatingChipInfo then return false end
+
+    if not isValid( otherChip ) then return false end
+    if not otherChip.hasInstance or not otherChip:hasInstance() then return false end
+    if generatingChipInfo.EntIndex == otherChip:entIndex() then return true end
+    if generatingChipInfo.CreationID == otherChip:getCreationID() then return true end
+    if generatingChipInfo.CreationTime == math.floor( otherChip:getCreationTime() ) then return true end
+
+    return false
+end
+
+local function markAsGeneratingChip( otherChip )
+    GDM.OwnerData.MapData.GeneratingChipInfo = {
+        EntIndex = otherChip:entIndex(),
+        CreationID = otherChip:getCreationID(),
+        CreationTime = math.floor( otherChip:getCreationTime() ),
+    }
+
+    GDM.pushOwnerData()
+end
+
+local function canGenerateData()
+    if isOtherChipGenerating( chip() ) then return true end
+
+    local generatingChipInfo = GDM.OwnerData.MapData.GeneratingChipInfo
+    if not generatingChipInfo then return true end
+
+    if not isOtherChipGenerating( entity( generatingChipInfo.EntIndex or 0 ) ) then -- This is clunky, isOtherChipGenerating() is due a refactor.
+        -- Other chip errored, flush it out.
+        GDM.OwnerData.MapData.GeneratingChipInfo = nil
+        GDM.pushOwnerData()
+
+        return true
+    end
+
+    return false
+end
+
+local function unmarkGeneratingChip()
+    GDM.OwnerData.MapData.GeneratingChipInfo = nil
+    GDM.pushOwnerData()
+end
+
+local function allowNextChipToGetData()
+    if not isOtherChipGenerating( chip() ) then return end
+
+    local otherChips = getWaitingChips()
+    local otherChip = otherChips[1]
+
+    if isValid( otherChip ) then
+        markAsGeneratingChip( otherChip )
+        hookRunRemoteFixed( otherChip, "LKL_MapData_StartGettingData", versionID, data )
+    else
+        unmarkGeneratingChip()
+    end
+end
+
+local function sendDataToNonOwners()
+    if libMapData.OWNER_ONLY then
+        allowNextChipToGetData()
+
+        return
+    end
+
+    local allButOwner = find.allPlayers( function( ply )
+        return ply ~= owner() and not ply:isBot()
+    end )
+
+    -- Starfall throws an error if the table is empty
+    if #allButOwner == 0 then
+        allowNextChipToGetData()
+
+        return
+    end
+
+    net.start( "LKL_MapData_SendData_NonOwner" )
+    safeStream.write( json.encode( data ), false, nil, function()
+        allowNextChipToGetData()
+    end )
+    net.send( allButOwner )
+end
+
+finishGeneratingData = function()
+    generatingData = false
+    dataIsReady = true
+
+    local now = timer.systime()
+    local timeElapsed = now - generationStartTime
+    local timeElapsedStr = ""
+
+    if timeElapsed < 0.01 then
+        timeElapsedStr = "< 0.01 seconds"
+    elseif timeElapsed >= 60 then
+        local minutes = math.floor( timeElapsed / 60 )
+        local seconds = math.round( timeElapsed - ( minutes * 60 ) )
+
+        timeElapsedStr = minutes .. " minutes"
+
+        if seconds > 0 then
+            timeElapsedStr = timeElapsedStr .. " and " .. seconds .. " seconds"
+        end
+    else
+        timeElapsedStr = math.round( timeElapsed, 2 ) .. " seconds"
+    end
+
+    print(
+        c_white, "[MapData] ",
+        c_pale_green, "Data generated in ",
+        c_yellow, timeElapsedStr,
+        c_pale_green, "! ",
+        c_pend_orange, "Saving data..."
+    )
+
+    net.start( "LKL_MapData_SendData" )
+    safeStream.write( json.encode( data ), false )
+    net.send( owner() )
+
+    sendDataToNonOwners()
+
+    if not hasSentReadyHook then
+        hasSentReadyHook = true
+        hook.run( "LKL_MapData_DataReady" )
+    end
+end
+
+local function startGeneratingData()
+    if generatingData then return end
+    if dataIsReady then return end
+
+    if not canGenerateData() then
+        waitingToGenerateData = true
+
+        return
+    end
+
+    generationStartTime = timer.systime()
+    generatingData = true
+    waitingToGenerateData = false
+    markAsGeneratingChip( chip() )
+
+    generateMapData()
+end
+
+
+if not libMapData.OWNER_ONLY then
+    hook.add( "ClientInitialized", "LKL_MapData_SendDataToNewPlayer", function( ply )
+        if not dataIsReady then return end
+        if not isValid( ply ) then return end
+        if ply == owner() then return end
+        if timer.exists( "LKL_MapData_SendData" ) then return end -- Trying to send to owner, non-owners will receive it after, sending now would be redundant.
+        if timer.exists( "LKL_MapData_SendData_NonOwner" ) then return end -- Ditto, trying to start the non-owner stream.
+
+        local delayDuration = 0.1
+
+        -- If the player initialized due to joining the server, they're going to be loading all sorts of stuff, so wait a bit.
+        if newPlayerLookup[ply] then
+            newPlayerLookup[ply] = nil
+            delayDuration = 10
+        end
+
+        timer.create( "LKL_MapData_SendData_NewJoin_" .. ply:getSteamID(), delayDuration, 1, function()
+            if not isValid( ply ) then return end
+
+            net.start( "LKL_MapData_SendData_NonOwner" )
+            safeStream.write( json.encode( data ), false )
+            net.send( ply )
+        end )
+    end )
+
+    hook.add( "PlayerInitialSpawn", "LKL_MapData_TrackNewJoins", function( ply )
+        newPlayerLookup[ply] = true
+    end )
+end
+
+hook.add( "EntityRemoved", "LKL_MapData_BecomeGeneratingChip", function( ent )
+    if not waitingToGenerateData then return end
+    if not ent then return end
+    if ent:getClass() ~= "starfall_processor" then return end
+    if ent:getOwner() ~= owner() then return end
+    if not isOtherChipGenerating( ent ) then return end
+
+    unmarkGeneratingChip()
+    startGeneratingData()
+end )
+
+hook.add( "StarfallError", "LKL_MapData_BecomeGeneratingChip", function( otherChip, otherOwner )
+    if not waitingToGenerateData then return end
+    if not isValid( otherChip ) then return end
+    if otherOwner ~= owner() then return end
+    if not isOtherChipGenerating( otherChip ) then return end
+
+    unmarkGeneratingChip()
+    startGeneratingData()
+end )
+
+hook.add( "Removed", "LKL_MapData_AllowNextChipToGetData", function()
+    allowNextChipToGetData()
+end )
+
+
+hook.add( "Remote_LKL_MapData_IsWaitingToGenerateData", "LKL_MapData_Response", function( _callingChip, callingPly )
+    if callingPly ~= owner() then return end
+
+    if waitingToGenerateData then
+        return true
+    end
+end )
+
+hook.add( "Remote_LKL_MapData_StartGettingData", "LKL_MapData_LoadOrGenerateData", function( _callingChip, callingPly, otherVersionID, otherData )
+    if callingPly ~= owner() then return end
+    if not waitingToGenerateData then return end
+
+    waitingToGenerateData = false
+
+    if otherVersionID == versionID then
+        data = otherData
+        finishGeneratingData()
+    else
+        -- Try reloading the data from the owner's client, in case it has changed. If it's not in the file, then we'll generate it like normal.
+        net.start( "LKL_MapData_TryLoadData" )
+        net.send( owner() )
+    end
+end )
+
+
+net.receive( "LKL_MapData_DoesServerNeedData", function( _, ply )
+    if ply ~= owner() then return end
+
+    net.start( "LKL_MapData_DoesServerNeedData_Response" )
+    net.writeBool( not dataIsReady )
+    net.send( owner() )
+end )
+
+net.receive( "LKL_MapData_GenerateData", function( _, ply )
+    if ply ~= owner() then return end
+
+    startGeneratingData()
+end )
+
+net.receive( "LKL_MapData_SendData", function( _, ply )
+    if ply ~= owner() then return end
+
+    safeStream.read( function( str )
+        data = json.decode( str )
+        dataIsReady = true
+        generatingData = false
+        waitingToGenerateData = false
+
+        sendDataToNonOwners()
+
+        if not hasSentReadyHook then
+            hasSentReadyHook = true
+            hook.run( "LKL_MapData_DataReady" )
+        end
+    end )
+end )
+
+
+do
+    local shouldPushGDM = false
+
+    if not GDM.OwnerData.MapData then
+        shouldPushGDM = true
+        GDM.OwnerData.MapData = {}
+    end
+
+    if shouldPushGDM then
+        GDM.pushOwnerData()
+    end
+end

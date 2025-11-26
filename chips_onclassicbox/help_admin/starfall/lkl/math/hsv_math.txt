@@ -1,0 +1,92 @@
+--@name HSV Math
+--@author legokidlogan
+--@shared
+
+--[[
+    - An assortment of functions involving HSV/RGB color space.
+    - Has hsvToRGB() and rgbToHSV() functions that properly preserve alpha, unlike base starfall.
+    - Has functions for lerping between two Colors.
+        - Color lerping is best done in HSV space, as it yields smooth, sensible transitions, unlike in RGB space.
+        - As such, regardless of input/output space, all lerp functions in this library will go through HSV space internally.
+--]]
+
+hsvMath = hsvMath or {}
+
+if hsvMath.hsvToRGB then return end
+
+
+local lerpClamped
+local lerpUnclamped
+
+
+-- Converts an HSV Color to an RGB Color, while properly preserving the alpha.
+function hsvMath.hsvToRGB( hsv )
+    local rgb = hsv:hsvToRGB()
+    rgb.a = hsv.a
+
+    return rgb
+end
+
+-- Converts an RGB Color to an HSV Color, while properly preserving the alpha.
+function hsvMath.rgbToHSV( rgb )
+    local hsv = rgb:rgbToHSV()
+    hsv.a = rgb.a
+
+    return hsv
+end
+
+-- Lerps between HSV Colors and yields an HSV Color. doClamp is optional, defaults to true.
+function hsvMath.lerpHSVToHSV( frac, fromHSV, toHSV, doClamp )
+    local lerpFunc = ( doClamp == false ) and lerpUnclamped or lerpClamped
+
+    local h = lerpFunc( frac, fromHSV.r, toHSV.r )
+    local s = lerpFunc( frac, fromHSV.g, toHSV.g )
+    local v = lerpFunc( frac, fromHSV.b, toHSV.b )
+    local a = lerpFunc( frac, fromHSV.a, toHSV.a )
+
+    return Color( h, s, v, a )
+end
+
+-- Lerps between HSV Colors and yields an RGB Color. doClamp is optional, defaults to true.
+function hsvMath.lerpHSVToRGB( frac, fromHSV, toHSV, doClamp )
+    local hsv = hsvMath.lerpHSVToHSV( frac, fromHSV, toHSV, doClamp )
+    local rgb = hsv:hsvToRGB()
+    rgb.a = hsv.a
+
+    return rgb
+end
+
+-- Converts to HSV, lerps, then converts back to RGB. doClamp is optional, defaults to true.
+function hsvMath.lerpRGBToRGB( frac, fromRGB, toRGB, doClamp )
+    local lerpFunc = ( doClamp == false ) and lerpUnclamped or lerpClamped
+    local fromHSV = fromRGB:rgbToHSV()
+    local toHSV = toRGB:rgbToHSV()
+
+    -- Lerp in HSV space manually to avoid redundant alpha set/get calls.
+    local h = lerpFunc( frac, fromHSV.r, toHSV.r )
+    local s = lerpFunc( frac, fromHSV.g, toHSV.g )
+    local v = lerpFunc( frac, fromHSV.b, toHSV.b )
+    local a = lerpFunc( frac, fromRGB.a, toRGB.a )
+
+    local rgb = Color( h, s, v ):hsvToRGB()
+    rgb.a = a
+
+    return rgb
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+lerpClamped = function( frac, from, to )
+    if from == to then return from end
+    if frac >= 1 then return to end
+    if frac <= 0 then return from end
+
+    return from + ( to - from ) * frac
+end
+
+lerpUnclamped = function( frac, from, to )
+    if from == to then return from end
+
+    return from + ( to - from ) * frac
+end

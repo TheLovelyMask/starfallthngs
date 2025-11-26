@@ -1,0 +1,101 @@
+--@name Middleclass Extras
+--@author legokidlogan
+--@shared
+
+if isInstanceOf then return end
+
+
+-- Whether or not obj is an instance of class, or a subclass of it
+function isInstanceOf( obj, class )
+    if type( obj ) ~= "table" then return false end
+
+    local func = obj.isInstanceOf
+    if not func then return false end
+
+    return func( obj, class )
+end
+
+-- Whether or not obj is a subclass of class, but not a direct instance of it
+function isSubclassOf( obj, class )
+    if type( obj ) ~= "table" then return false end
+
+    local func = obj.isSubclassOf
+    if not func then return false end
+
+    return func( obj, class )
+end
+
+-- Whether or not obj is a direct instance of class
+function isClass( obj, class )
+    if type( obj ) ~= "table" then return false end
+
+    local objClass = obj.class
+    if not objClass then return false end
+
+    return objClass == class
+end
+
+-- Whether or not obj's class name is exactly className
+function isClassByName( obj, className )
+    if type( obj ) ~= "table" then return false end
+
+    local objClass = obj.class
+    if type( objClass ) ~= "table" then return false end
+
+    local objClassName = objClass.name
+    if not objClassName then return false end
+
+    return objClassName == className
+end
+
+--[[
+    - Whether or not tbl is a middleclass instance object.
+    - tbl must be a table, otherwise this will error.
+    - This is faster than isInstanceObject() by skipping the type check.
+--]]
+function isTableInstanceObject( tbl )
+    return isClassObject( tbl.class )
+end
+
+-- Whether or not obj is a middleclass instance object.
+function isInstanceObject( obj )
+    if type( obj ) ~= "table" then return false end
+
+    return isTableInstanceObject( obj )
+end
+
+--[[
+    - Whether or not tbl is a middleclass class object.
+    - tbl must be a table, otherwise this will error.
+    - This is faster than isClassObject() by skipping the type check.
+--]]
+function isTableClassObject( tbl )
+    if tbl.name == nil then return false end
+    if tbl.subclass == nil then return false end
+    if tbl.allocate == nil then return false end
+
+    return true
+end
+
+-- Whether or not obj is a middleclass class object
+function isClassObject( obj )
+    if type( obj ) ~= "table" then return false end
+
+    return isTableClassObject( obj )
+end
+
+--[[
+    - Whether or not tbl is a middleclass object (class or instance).
+    - tbl must be a table, otherwise this will error.
+    - This is faster than isMiddleclassObject() by skipping the type check.
+--]]
+function isTableMiddleclassObject( tbl )
+    return isTableInstanceObject( tbl ) or isTableClassObject( tbl )
+end
+
+-- Whether or not obj is a middleclass object (class or instance).
+function isMiddleclassObject( obj )
+    if type( obj ) ~= "table" then return false end
+
+    return isTableMiddleclassObject( obj )
+end

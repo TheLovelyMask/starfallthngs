@@ -1,0 +1,600 @@
+--@name Micromanage
+--@author modified by thelovelymask
+--@shared
+--@include sb/util.txt
+
+local Util = require("sb/util.txt")
+
+local Micromanage = {}
+Micromanage.Selection = nil
+
+local PADDING = 3
+local FONT_HEIGHT = 22
+local SELECT_HITBOX_PADDING = 30
+local PP_COURSE_E2_NAME = "proppush_course"
+
+-- PermissionLevels: all important actions mapped to operator as requested
+local PermissionLevels = {
+    ["operator"] = 3
+}
+
+-- Shared option container
+Micromanage.Options = {}
+Micromanage.ChoosableOptions = {}
+
+-- network names for server-side ops
+local NET_CLEANUP = "micromanage_cleanup"
+local NET_FREEZEPROPS = "micromanage_freezeprops"
+
+-- useCommandOn:
+--  - if command starts with "ulx" or is any console command that should be run as owner -> run client-side concmd but only if player() == owner()
+--  - if called on server context, attempt to run concmd on server as fallback (but primary method is client-side owner concmd)
+--  - cleanup/freezeprops are NOT handled here (those are separate net handlers)
+function Micromanage.useCommandOn(command, plr, ...)
+    local args = {...}
+    local argstr = ""
+    if #args > 0 then argstr = " " .. table.concat(args, " ") end
+    local isULX = tostring(command):sub(1,3) == "ulx"
+    local steam = (plr and plr.getSteamID and plr:getSteamID()) or ""
+
+    -- If this is cleanup/freezeprops we SHOULD NOT run via client concmd  those options use net messages
+    if tostring(command):lower():find("cleanup") or tostring(command):lower():find("freezeprops") then
+        -- do nothing here; those options should call the nets defined below
+        return
+    end
+
+    -- Preferred path: owner executes concmd locally (so command originates from owner's console)
+    if CLIENT then
+        if player() ~= owner() then
+            -- non-owner clients must not be able to execute commands
+            return
+        end
+
+        -- Run the command as the owner locally
+        local full
+        -- for ULX commands, use $steam syntax so ULX targets are robust, but running concmd as owner will be from owner anyway
+        if isULX then
+            -- prefer to use $steam to be explicit
+            full = command .. " " .. "\"" .. "$" .. steam .. "\"" .. argstr
+        else
+            full = command .. " " .. "\"" .. steam .. "\"" .. argstr
+        end
+
+        pcall(function() concmd(full) end)
+        return
+    end
+
+    -- Server fallback (if called server-side)
+    if SERVER then
+        -- run command on server console (less ideal for owner-as-caller requirement but kept as fallback)
+        local full
+        if isULX then
+            full = command .. " " .. "\"" .. "$" .. steam .. "\"" .. argstr
+        else
+            full = command .. " " .. "\"" .. steam .. "\"" .. argstr
+        end
+        pcall(function() concmd(full) end)
+    end
+end
+
+local OptionStruct = {
+    -- Draw intentionally nil (client will fallback to default icon+text draw)
+    Draw = nil,
+    Use = function(self, plr)
+        if self.Commands then
+            for i,v in pairs(self.Commands) do
+                Micromanage.useCommandOn(v, plr)
+            end
+        end
+    end,
+    ShouldDisplay = function(Player) return true end,
+    Restrict = "operator",
+    Icon = nil
+}
+
+-- addOption safe for shared: material/createFont/render only used on client
+function Micromanage:addOption( Data, Pos )
+    -- apply defaults but keep Draw == nil unless user provided one
+    Util.applyDefaults(Data, OptionStruct)
+    Data.SelectionLerp = Data.SelectionLerp or 0
+
+    if Pos then
+        table.insert(Micromanage.Options, Pos, Data)
+    else
+        table.insert(Micromanage.Options, Data)
+    end
+
+    -- client-only: replace Icon path with material if available
+    if CLIENT and Data.Icon and material then
+        pcall(function()
+            Data.IconMat = material.createFromImage(Data.Icon, "")
+        end)
+    end
+
+    return Data
+end
+
+function Micromanage:removeOption( name )
+    for i,v in pairs(Micromanage.Options) do
+        if v.Name == name then
+            table.remove(Micromanage.Options, i)
+            break
+        end
+    end
+end
+
+function Micromanage.isRagdolled( plr )
+    return plr:getEyePos():isZero()
+end
+
+function Micromanage.scaleColor( num, max )
+    return Color(255,255*math.clamp(1 - num/max, 0, 1),255*math.clamp(1 - num/max, 0, 1))
+end
+
+function Micromanage.isInJail( plr )
+    local ok, floor = pcall(function() return trace.line( plr:getPos(), plr:getPos() + Vector(0,0,1000), find.allPlayers() ) end)
+    if not ok or not floor or not floor.Entity then return false end
+    local ent = floor.Entity
+    if not isValid(ent) then return false end
+    local ok2, ownerEnt = pcall(function() return ent:getOwner() end)
+    return (not ok2 or ownerEnt == nil) and ent:getModel() == "models/props_building_details/storefront_template001a_bars.mdl"
+end
+
+-- ================= SERVER =================
+if SERVER then
+    -- register nets server-side only
+    pcall(function()
+        util.AddNetworkString(NET_CLEANUP)
+        util.AddNetworkString(NET_FREEZEPROPS)
+    end)
+
+    -- cleanup handler: remove all entities owned by target steamid
+    net.receive(NET_CLEANUP, function(len, ply)
+        -- only owner can request cleanup
+        if not isValid(ply) or ply ~= owner() then return end
+        local steam = nil
+        local ok = pcall(function() steam = net.readString() end)
+        if not ok or not steam then return end
+
+        local removedCount = 0
+        local all = {}
+        pcall(function() all = find.all() end)
+        for _, e in ipairs(all) do
+            if not isValid(e) then continue end
+            local ok2, entOwner = pcall(function() return e:getOwner() end)
+            if ok2 and isValid(entOwner) and entOwner:getSteamID() == steam then
+                pcall(function() e:remove() end)
+                removedCount = removedCount + 1
+            end
+        end
+
+        -- optional feedback to owner
+        pcall(function()
+            if isValid(owner()) then
+                owner():print("[Micromanage] removed " .. tostring(removedCount) .. " entities owned by " .. steam)
+            end
+        end)
+    end)
+
+    -- freezeprops handler: setFrozen for all entities owned by target steamid
+    net.receive(NET_FREEZEPROPS, function(len, ply)
+        -- only owner can request freezeprops
+        if not isValid(ply) or ply ~= owner() then return end
+        local steam = nil
+        local doFreeze = true
+        local ok = pcall(function() steam = net.readString(); doFreeze = net.readBool() end)
+        if not ok or not steam then return end
+
+        local affected = 0
+        local all = {}
+        pcall(function() all = find.all() end)
+        for _, e in ipairs(all) do
+            if not isValid(e) then continue end
+            local ok2, entOwner = pcall(function() return e:getOwner() end)
+            if ok2 and isValid(entOwner) and entOwner:getSteamID() == steam then
+                pcall(function()
+                    -- prefer setFrozen, fallback to enableMotion
+                    if e.setFrozen then
+                        e:setFrozen(doFreeze)
+                    elseif e.enableMotion then
+                        e:enableMotion(not doFreeze)
+                    end
+                end)
+                affected = affected + 1
+            end
+        end
+
+        -- optional feedback
+        pcall(function()
+            if isValid(owner()) then
+                owner():print("[Micromanage] setFrozen=" .. tostring(doFreeze) .. " on " .. tostring(affected) .. " entities for " .. steam)
+            end
+        end)
+    end)
+end
+
+-- ================= CLIENT =================
+if CLIENT then
+    -- client-only rendering objects and HUD behaviour
+    local Fonts = {
+        Main = render.createFont("Coolvetica", FONT_HEIGHT, 1200, true)
+    }
+    render.setFont(Fonts.Main)
+
+    -- convenience: draw a single option using material when available
+    local function drawOptionIcon( iconMat, name, doDropdown, buttonX, buttonY )
+        render.setColor( Color(255,255,255) )
+        if iconMat then
+            pcall(function()
+                render.setMaterial(iconMat)
+                render.drawTexturedRect(buttonX + 4, buttonY + 4, 20, 20)
+                render.setMaterial(nil)
+            end)
+        end
+        render.drawSimpleText(buttonX + PADDING + 28, buttonY + 14, name, 0, 1)
+        if doDropdown then
+            local tX = buttonX + 196 - PADDING
+            local tY = buttonY + 15
+            render.drawTriangle(tX - 6, tY - 6, tX, tY, tX - 6, tY + 6)
+        end
+    end
+
+    -- now add all options (client builds UI only)
+    -- first clear any existing (defensive)
+    Micromanage.Options = {}
+    Micromanage.ChoosableOptions = {}
+
+    -- Copy SteamID
+    Micromanage:addOption({
+        Name = "Copy SteamID",
+        Icon = "icon16/vcard_edit.png",
+        Use = function( self, plr )
+            setClipboardText( plr:getSteamID() )
+        end,
+        Restrict = "operator"
+    })
+
+    -- Spectate (client-side)
+    Micromanage:addOption({
+        Name = "Spectate",
+        Restrict = "operator",
+        Icon = "icon16/eye.png",
+        Use = function(self, plr)
+            -- run client concmd as owner (this block only reachable for owner due to GUI checks)
+            if player() ~= owner() then return end
+            pcall(function() concmd("fspectate \"" .. plr:getSteamID() .. "\"") end)
+        end
+    })
+
+    -- Freeze (ulx freeze/unfreeze) + request server freezeprops
+    Micromanage:addOption({
+        Name = "Freeze",
+        Restrict = "operator",
+        Icon = "icon16/stop.png",
+        Draw = function( self, plr, buttonX, buttonY )
+            drawOptionIcon(self.IconMat, plr:isFrozen() and "Unfreeze" or "Freeze", false, buttonX, buttonY)
+        end,
+        Use = function( self, plr )
+            if player() ~= owner() then return end
+            if not plr:isFrozen() then
+                -- owner executes ULX freeze locally (so it comes from your name)
+                Micromanage.useCommandOn("ulx freeze", plr)
+                -- ask server to freeze their props
+                net.start(NET_FREEZEPROPS)
+                net.writeString(plr:getSteamID())
+                net.writeBool(true)
+                net.send()
+            else
+                Micromanage.useCommandOn("ulx unfreeze", plr)
+                net.start(NET_FREEZEPROPS)
+                net.writeString(plr:getSteamID())
+                net.writeBool(false)
+                net.send()
+            end
+        end
+    })
+
+    -- Freeze Props explicit (server-side op)
+    Micromanage:addOption({
+        Name = "Freeze Props",
+        Restrict = "operator",
+        Icon = "icon16/wand.png",
+        Use = function( self, plr )
+            net.start(NET_FREEZEPROPS)
+            net.writeString(plr:getSteamID())
+            net.writeBool(true)
+            net.send()
+        end
+    })
+
+    -- Cleanup (request server to remove)
+    Micromanage:addOption({
+        Name = "Cleanup",
+        Restrict = "operator",
+        Icon = "icon16/cut_red.png",
+        Initialize = function( self, plr )
+            plr.EntCountCache = #find.all(function(e)
+                return e:getOwner() == plr
+            end)
+        end,
+        Draw = function( self, plr, buttonX, buttonY )
+            drawOptionIcon(self.IconMat, self.Name, false, buttonX, buttonY)
+            render.setColor( Micromanage.scaleColor(plr.EntCountCache or 0, 100) )
+            render.drawSimpleText( buttonX + 200 - PADDING, buttonY + 14, plr.EntCountCache or "", 2, 1 )
+        end,
+        Use = function( self, plr )
+            net.start(NET_CLEANUP)
+            net.writeString(plr:getSteamID())
+            net.send()
+        end
+    })
+
+    -- Goto (owner executes ULX goto locally)
+    Micromanage:addOption({
+        Name = "Goto",
+        Restrict = "operator",
+        Icon = "icon16/user_go.png",
+        Commands = {
+            "ulx goto"
+        }
+    })
+
+    -- FBring (bring + freeze) -- restored to use useCommandOn so owner runs the ULX commands
+    Micromanage:addOption({
+        Name = "FBring",
+        Restrict = "operator",
+        Icon = "icon16/arrow_in.png",
+        Commands = {
+            "ulx bring",
+            "ulx freeze"
+        }
+    })
+
+    -- FReturn (unfreeze + return)
+    Micromanage:addOption({
+        Name = "FReturn",
+        Restrict = "operator",
+        Icon = "icon16/arrow_out.png",
+        Commands = {
+            "ulx unfreeze",
+            "ulx return"
+        }
+    })
+
+    -- Sit (bring/jail/freezeprops and announce; return does unjail/return/unfreeze and announce)
+    Micromanage:addOption({
+        Name = "Sit",
+        Restrict = "operator",
+        Icon = "icon16/report_link.png",
+        Draw = function( self, plr, buttonX, buttonY )
+            drawOptionIcon(self.IconMat, Micromanage.isInJail(plr) and "Return" or "Sit", false, buttonX, buttonY)
+        end,
+        Use = function( self, plr )
+            if player() ~= owner() then return end
+            if not Micromanage.isInJail(plr) then
+                Micromanage.useCommandOn("ulx bring", plr)
+                Micromanage.useCommandOn("ulx jail", plr)
+                net.start(NET_FREEZEPROPS); net.writeString(plr:getSteamID()); net.writeBool(true); net.send()
+                -- announce as owner
+                pcall(function() concmd('say "<color=255,0,0>[ADMINSIT]<color=255,255,255> ' .. plr:getName() .. ' teleported"') end)
+            else
+                Micromanage.useCommandOn("ulx unjail", plr)
+                Micromanage.useCommandOn("ulx return", plr)
+                net.start(NET_FREEZEPROPS); net.writeString(plr:getSteamID()); net.writeBool(false); net.send()
+                pcall(function() concmd('say "<color=255,0,0>[ADMINSIT]<color=255,255,255> ' .. plr:getName() .. ' returned"') end)
+            end
+        end
+    })
+
+    -- Proppush Course integration (keep)
+    Micromanage:addOption({
+        Name = "Proppush Course",
+        Restrict = "operator",
+        Icon = "icon16/computer_go.png",
+        Use = function( self, plr )
+            if player() ~= owner() then return end
+            concmd("say_team .course " .. plr:getName())
+        end,
+        ShouldDisplay = function()
+            return #find.byClass("gmod_wire_expression2", function(e)
+                local ok, o = pcall(function() return e:getOwner() end)
+                return ok and isValid(o) and o == owner() and e:getChipName() == PP_COURSE_E2_NAME
+            end) > 0
+        end
+    })
+
+    -- UI interactions: owner-only
+    Util.bindPress("MOUSE2", function()
+        if not isValid(player()) or player() ~= owner() then return end
+        if not input.isKeyDown(13) then return end -- C
+        if owner():isPVP() and (not owner():isNoclipped() or isValid(owner():getVehicle())) then return end
+
+        local mX, mY = input.getCursorPos()
+        local bestDist = math.huge
+        local bestPlayer = nil
+
+        for i,v in pairs(find.allPlayers()) do
+            if v == owner() or not v.sX then continue end
+            local minX = v.sX - SELECT_HITBOX_PADDING
+            local minY = v.sY - SELECT_HITBOX_PADDING
+            local maxX = v.sX + v.sW + SELECT_HITBOX_PADDING
+            local maxY = v.sY + v.sH + SELECT_HITBOX_PADDING
+            if mX > minX and mY > minY and mX < maxX and mY < maxY then
+                local cX = v.sX + v.sW/2
+                local cY = v.sY + v.sH/2
+                local dist = (mX - cX)^2 + (mY - cY)^2
+                if dist < bestDist then
+                    bestDist = dist
+                    bestPlayer = v
+                end
+            end
+        end
+
+        Micromanage.Selection = nil
+        table.empty(Micromanage.ChoosableOptions)
+
+        if not bestPlayer then return end
+
+        Micromanage.Selection = bestPlayer
+        local PermissionLevel = PermissionLevels[player():getTeamName()] or 0
+
+        for i,v in pairs(Micromanage.Options) do
+            if not v.ShouldDisplay(Micromanage.Selection) then continue end
+            if v.Initialize then v:Initialize(bestPlayer) end
+            table.insert(Micromanage.ChoosableOptions, v)
+        end
+    end)
+
+    local SelectedOption = nil
+    local MouseDown = false
+
+    local function isMicromanageAllowed()
+        if not isValid(player()) or player() ~= owner() then return false end
+        return owner():isBUILD() or (owner():isNoclipped() and not isValid(owner():getVehicle()))
+    end
+
+    local function setOptionSelection(n)
+        if SelectedOption == n then return end
+        SelectedOption = n
+        MouseDown = false
+    end
+
+    Util.bindRelease("c", function()
+        if not isValid(player()) or player() ~= owner() then return end
+        Micromanage.Selection = nil
+        setOptionSelection(nil)
+    end)
+
+    Util.bindPress("MOUSE1", function()
+        if not isMicromanageAllowed() then return end
+        local Option = Micromanage.ChoosableOptions[SelectedOption]
+        if not Option then return end
+        MouseDown = true
+    end)
+
+    Util.bindRelease("MOUSE1", function()
+        if not isMicromanageAllowed() then return end
+        if not MouseDown then return end
+        MouseDown = false
+        local Option = Micromanage.ChoosableOptions[SelectedOption]
+        if not Option then return end
+        Option:Use(Micromanage.Selection)
+    end)
+
+    enableHud(player(), true)
+
+    Util.bindPress("c", function()
+        if not isMicromanageAllowed() then return end
+        if not render.isHUDActive() then return end
+        input.enableCursor(true)
+    end)
+
+    Util.bindRelease("c", function()
+        if not isMicromanageAllowed() then return end
+        if not render.isHUDActive() then return end
+        input.enableCursor(false)
+    end)
+
+    hook.add("drawhud", "Micromanage_HUD", function()
+        -- owner-only HUD
+        if not isValid(player()) or player() ~= owner() then return end
+        if not input.isKeyDown(13) then return end -- C
+        if not isMicromanageAllowed() then return end
+
+        render.setFilterMag(2)
+
+        local hasSelection = Micromanage.Selection ~= nil
+
+        for i,plr in pairs(find.allPlayers()) do
+            if plr == owner() then continue end
+
+            render.setFont(Fonts.Main)
+
+            local selected = Micromanage.Selection == plr
+
+            if not selected then
+                local ok, screen = pcall(function() return (plr:getPos() + Vector(0,0,64)):toScreen() end)
+                if not ok or not screen then continue end
+                local pX = screen.x
+                local pY = screen.y
+
+                local nameWidth, nameHeight = render.getTextSize(plr:getName())
+                local w = nameWidth + 100 + PADDING*2
+                local h = nameHeight + PADDING*2
+
+                plr.sX = pX
+                plr.sY = pY
+                plr.sW = w
+                plr.sH = h
+            end
+
+            local bgA = (hasSelection and not selected and 44 or 230)
+            local tA = (hasSelection and not selected and 60 or 255)
+
+            render.setColor(Color(44,44,44, bgA))
+            render.drawRect(plr.sX, plr.sY, plr.sW, plr.sH)
+
+            render.setColor(team.getColor(plr:getTeam()):setA(tA))
+            render.drawSimpleText(plr.sX + PADDING, plr.sY + PADDING, plr:getName())
+
+            render.setColor(plr:isPVP() and Color(255,0,0, tA) or Color(0,255,0, tA))
+            render.drawSimpleText(plr.sX + plr.sW - PADDING, plr.sY + PADDING, plr:isPVP() and "PvP" or "Build", 2)
+
+            if plr:isPVP() then
+                local hpc = plr:getHealth() / plr:getMaxHealth()
+                local healthCol = Color(hpc*120, 1, 1):hsvToRGB()
+                healthCol:setA(tA)
+
+                render.setColor(Color(0,0,0, tA))
+                render.drawRect(plr.sX, plr.sY + plr.sH - 1, plr.sW, 1)
+
+                render.setColor(healthCol)
+                render.drawRect(plr.sX, plr.sY + plr.sH - 1, plr.sW*hpc, 1)
+            end
+
+            if selected then
+                local mX, mY = input.getCursorPos()
+                local localmX = mX - (plr.sX + plr.sW + PADDING)
+                local localmY = mY - plr.sY
+
+                setOptionSelection(localmX > 0 and localmX < 200 and math.ceil(localmY / (FONT_HEIGHT / 0.75)) or -1)
+
+                for i,v in pairs(Micromanage.ChoosableOptions) do
+                    local Goal = (i == SelectedOption) and 1 or 0
+                    v.SelectionLerp = math.lerp(0.4, v.SelectionLerp, Goal)
+
+                    local buttonX = plr.sX + plr.sW + PADDING
+                    local buttonY = plr.sY + FONT_HEIGHT / 0.75 * (i - 1)
+
+                    local shadeGoal = 44
+                    if (i == SelectedOption) then
+                        if MouseDown then shadeGoal = 22 else shadeGoal = 255 end
+                    end
+
+                    local shade = math.lerp(v.SelectionLerp, 44, shadeGoal)
+
+                    render.setColor(Color(shade,shade,shade, bgA))
+                    render.drawRect(buttonX, buttonY, 200, FONT_HEIGHT / 0.75)
+
+                    -- fallback: if option provided Draw -> call it, otherwise draw icon+name
+                    if v.Draw then
+                        pcall(function() v:Draw(plr, buttonX, buttonY) end)
+                    else
+                        drawOptionIcon(v.IconMat, v.Name, v.Dropdown ~= nil, buttonX, buttonY)
+                    end
+
+                    render.setColor(Color(255,255,255))
+                    render.drawLine(buttonX, buttonY + FONT_HEIGHT / 0.75 - 1, buttonX + 200, buttonY + FONT_HEIGHT / 0.75 - 1)
+                end
+            end
+        end
+    end)
+
+    hook.add("PlayerDisconnect", "Micromanage_RemoveTargetOnDisconnect", function(_, _, plr)
+        if Micromanage.Selection == plr then
+            Micromanage.Selection = nil
+        end
+    end)
+end
+
+return Micromanage

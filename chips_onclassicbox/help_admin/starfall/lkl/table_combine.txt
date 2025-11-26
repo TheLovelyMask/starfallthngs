@@ -1,0 +1,33 @@
+--@name Table Combine
+--@author legokidlogan
+--@shared
+
+
+--[[
+    - Appends entries from source into target, without adding duplicate values.
+    - Both tables must be sequential.
+    - Modifies in-place and returns the target table.
+
+    - Example:
+        local target = { 1, 2, 3 }
+        local source = { 3, 4, 5 }
+
+        table.combine( target, source )
+        -- target is now { 1, 2, 3, 4, 5 }
+--]]
+function table.combine( target, source )
+    local targVals = {}
+    local tableInsert = table.insert
+
+    for _, v in ipairs( target ) do
+        targVals[v] = true
+    end
+
+    for _, v in ipairs( source ) do
+        if not targVals[v] then
+            tableInsert( target, v )
+        end
+    end
+
+    return target
+end

@@ -1,0 +1,843 @@
+--@name Mesh Minimap
+--@author
+--@shared
+--@include lkl/map_mesh.txt
+--@include lkl/gcolors.txt
+--@include lkl/render/poly_tools.txt
+
+
+libMapMesh = libMapMesh or {}
+libMeshMinimap = libMeshMinimap or {}
+
+-- DEFAULT OVERRIDES TO map_mesh
+if libMapMesh.LOAD_IMMEDIATELY == nil then libMapMesh.LOAD_IMMEDIATELY = false end
+if libMapMesh.ADD_FLOOR == nil then libMapMesh.ADD_FLOOR = false end
+if libMapMesh.SKYBOX_BRUSHES_INTO_WORLD == nil then libMapMesh.SKYBOX_BRUSHES_INTO_WORLD = false end
+-- END DEFAULT OVERRIDES
+
+require( "lkl/map_mesh.txt" )
+
+if SERVER then return end
+
+require( "lkl/gcolors.txt" )
+require( "lkl/render/poly_tools.txt" )
+
+
+-- CONFIG DEFAULTS 1 (Must be set before require'ing this file)
+libMeshMinimap.ZOOM_LEVEL = libMeshMinimap.ZOOM_LEVEL or 0.05 -- Zoom level of the minimap. Can be changed, but must be done via libMeshMinimap.setZoomLevel() after the meshes are ready.
+libMeshMinimap.DOT_SIDES = libMeshMinimap.DOT_SIDES or 16 -- Number of sides on the dots.
+libMeshMinimap.DOT_UPDATE_INTERVAL = libMeshMinimap.DOT_UPDATE_INTERVAL or 1 -- How often to search for dots and update color and visibility.
+libMeshMinimap.DOT_TYPES = libMeshMinimap.DOT_TYPES or {} -- You shouldn't override this table after require'ing the file, but you can edit its contents.
+
+libMeshMinimap.COMPASS_FONT = libMeshMinimap.COMPASS_FONT or "Default" -- Font of the compass.
+libMeshMinimap.COMPASS_FONT_SIZE = libMeshMinimap.COMPASS_FONT_SIZE or ( 20 / 1920 ) -- Font size of the compass, as a fraction of the screen width.
+if libMeshMinimap.COMPASS_FONT_ANTIALIAS == nil then libMeshMinimap.COMPASS_FONT_ANTIALIAS = true end -- Whether to antialias the compass font.
+if libMeshMinimap.COMPASS_FONT_OUTLINE == nil then libMeshMinimap.COMPASS_FONT_OUTLINE = false end -- Whether to outline the compass text. 
+libMeshMinimap.COMPASS_FONT_OUTLINE_THINNESS = libMeshMinimap.COMPASS_FONT_OUTLINE_THINNESS or 2 -- Higher value for thinner outlines.
+libMeshMinimap.COMPASS_FONT_WEIGHT = libMeshMinimap.COMPASS_FONT_WEIGHT or 400 -- Weight of the compass font.
+
+if libMeshMinimap.PLAYERS_ENABLED == nil then libMeshMinimap.PLAYERS_ENABLED = true end -- Enables player dots. You can also enable this but put in your own custom entry for players.
+if libMeshMinimap.PLAYERS_PVP_HIDE == nil then libMeshMinimap.PLAYERS_PVP_HIDE = true end -- Hides player dots if both you and them are in pvp.
+if libMeshMinimap.PLAYERS_REQUIRE_LOS == nil then libMeshMinimap.PLAYERS_REQUIRE_LOS = false end -- Only shows player dots if they have line of sight.
+if libMeshMinimap.PLAYERS_DIRECTIONAl == nil then libMeshMinimap.PLAYERS_DIRECTIONAl = true end -- Shows the facing direction of players.
+
+libMeshMinimap.CEILING_TRACE_TINT_COLOR = libMeshMinimap.CEILING_TRACE_TINT_COLOR or Color( 200, 150, 150, 255 ) -- Can be changed, but must be done via libMeshMinimap.setCeilingTintColor().
+-- END CONFIG DEFAULTS 1
+
+-- CONFIG DEFAULTS 2 (Can be changed at any time)
+libMeshMinimap.WIDTH = libMeshMinimap.WIDTH or 0.15 -- Width of the minimap, as a fraction of the screen width.
+libMeshMinimap.X_POS = libMeshMinimap.X_POS or 0.07 -- X position of the minimap's center, as a fraction of the screen width.
+libMeshMinimap.Y_POS = libMeshMinimap.Y_POS or 0.07 -- Y position of the minimap's center, as a fraction of the screen height.
+if libMeshMinimap.Y_POS_BY_WIDTH == nil then libMeshMinimap.Y_POS_BY_WIDTH = true end -- Whether to use the screen width to calculate the Y position.
+libMeshMinimap.BORDER_THICKNESS = libMeshMinimap.BORDER_THICKNESS or 0.05 -- Thickness of the border, as a fraction of the minimap's width. 0 to disable.
+libMeshMinimap.BORDER_COLOR = libMeshMinimap.BORDER_COLOR or Color( 255, 255, 255, 255 ) -- Color of the border.
+libMeshMinimap.BACKGROUND_COLOR = libMeshMinimap.BACKGROUND_COLOR or Color( 0, 0, 0, 255 ) -- Color of the background.
+if libMeshMinimap.USE_CALCVIEW == nil then libMeshMinimap.USE_CALCVIEW = true end -- Account for calcview for the local player's position and angles.
+if libMeshMinimap.HIDE_IN_TOOLGUN == nil then libMeshMinimap.HIDE_IN_TOOLGUN = true end -- Hide the minimap while the toolgun is held.
+if libMeshMinimap.HIDE_IN_CONTEXT_MENU == nil then libMeshMinimap.HIDE_IN_CONTEXT_MENU = false end -- Hide the minimap while the context menu is open.
+
+if libMeshMinimap.CEILING_TRACE == nil then libMeshMinimap.CEILING_TRACE = true end -- Use a ceiling trace to determine the render height of the minimap, instead of just the player's eye height.
+if libMeshMinimap.CEILING_TRACE_TINT == nil then libMeshMinimap.CEILING_TRACE_TINT = true end -- Tints parts of the map that are between your eye height and the ceiling trace to show they aren't at your level.
+
+libMeshMinimap.CLIENT_INDICATOR_SIZE = libMeshMinimap.CLIENT_INDICATOR_SIZE or 0.05 -- Size of the local player's triangle, as a fraction of the minimap's width. 0 to disable.
+libMeshMinimap.CLIENT_INDICATOR_COLOR = libMeshMinimap.CLIENT_INDICATOR_COLOR or Color( 255, 255, 200, 255 ) -- Color of the local player's triangle.
+
+libMeshMinimap.COMPASS_MODE = libMeshMinimap.COMPASS_MODE or 3 -- 0: Off, 1: North South East West, 2: +y -y +x -x, 3: Both.
+libMeshMinimap.COMPASS_COLOR_NSEW = libMeshMinimap.COMPASS_COLOR_NSEW or Color( 255, 255, 255, 255 ) -- Color of the compass NSEW text.
+libMeshMinimap.COMPASS_COLOR_X = libMeshMinimap.COMPASS_COLOR_X or Color( 255, 0, 0, 255 ) -- Color of the compass X text.
+libMeshMinimap.COMPASS_COLOR_Y = libMeshMinimap.COMPASS_COLOR_Y or Color( 0, 255, 0, 255 ) -- Color of the compass Y text.
+
+libMeshMinimap.DOT_SIZE = libMeshMinimap.DOT_SIZE or 0.02 -- Size of the dots, as a fraction of the minimap's width. 0 disables dots altogether.
+libMeshMinimap.DOT_RING_THICKNESS = libMeshMinimap.DOT_RING_THICKNESS or 0.25 -- Thickness of the dot rings, as a fraction of the dot's size.
+libMeshMinimap.DOT_HEIGHT_TRIANGLE = libMeshMinimap.DOT_HEIGHT_TRIANGLE or 100 -- Height difference needed between the local player and the dot to show an up/down triangle. Set to 0 to disable.
+libMeshMinimap.DOT_HEIGHT_HIDE = libMeshMinimap.DOT_HEIGHT_HIDE or 3000 -- Height difference needed between the local player and the dot to hide it. Set to 0 to always show.
+libMeshMinimap.DOT_HEIGHT_COLOR = libMeshMinimap.DOT_HEIGHT_COLOR or Color( 255, 255, 255, 255 ) -- Color of the height triangle.
+libMeshMinimap.DOT_PERF_LIMIT = libMeshMinimap.DOT_PERF_LIMIT or 0.5 -- Fraction of the CPU limit to use for dot updates.
+
+libMeshMinimap.DOT_TYPES["player"] = libMeshMinimap.DOT_TYPES["player"] or {
+    priority = 10000,
+    color = pvp and function( ent ) return ent:isInPvp() and c_pvp or c_build end or c_pvp,
+    ringColor = function( ent ) return team.getColor( ent:getTeam() ) end,
+    requireLOS = libMeshMinimap.PLAYERS_REQUIRE_LOS,
+    getPosLOS = function( ent ) return ent:getShootPos() end,
+    getPos = function( ent ) return ent:getPos() end,
+    canShow = libMeshMinimap.PLAYERS_PVP_HIDE and function( ent ) return ent ~= player() and ( not player():isInPvp() or not ent:isInPvp() ) end or function( ent ) return ent ~= player() end,
+    getYaw = libMeshMinimap.PLAYERS_DIRECTIONAl and function( ent ) return ent:getEyeAngles()[2] end or nil,
+    heightTriangle = nil,
+    heightHide = nil,
+    dotScale = nil,
+    dotSize = nil,
+    dotSizeWorld = nil,
+    findFunc = nil,
+    disabled = not libMeshMinimap.PLAYERS_ENABLED,
+}
+-- END CONFIG DEFAULTS 2
+
+--[[ Dot type syntax:
+libMeshMinimap.DOT_TYPES["class_name"] = {
+    priority = (nil or number or function( ent ) return nil or number end ), -- Higher priority dots are drawn on top of lower priority dots. Defaults to 1000.
+    color = (Color or function( ent ) return Color end), -- Color of the dot.
+    ringColor = (nil or Color or function( ent ) return nil or Color end), -- Color of the dot's ring. nil to disable.
+    requireLOS = (bool or function( ent ) return bool end), -- Only show the dot if the local player has line of sight to it.
+    getPosLOS = (nil or function( ent ) return Vector end), -- Function to get the position to check line of sight from. Defaults to ent:obbCenterW().
+    getPos = (nil or function( ent ) return Vector end), -- Function to get the position for drawing the dot. Defaults to ent:obbCenterW().
+    canShow = (nil or function( ent ) return bool end), -- Only show the dot if this function returns true. nil to always show.
+    getYaw = (nil or function( ent ) return nil or number end), -- Uses a pointed dot to indicate direction. nil to disable.
+    heightTriangle = (nil or number >= 0 or function( ent ) return nil or number end), -- Overrides the global DOT_HEIGHT_TRIANGLE for this dot type.
+    heightHide = (nil or number >= 0 or function( ent ) return nil or number end), -- Overrides the global DOT_HEIGHT_HIDE for this dot type.
+    dotScale = (nil or number >= 0 or function( ent ) return nil or number end), -- Scales the dot size. nil to make no change. Size modifiers only apply on update intervals.
+    dotSize = (nil or number >= 0 or function( ent ) return nil or number end), -- Overrides the dot size. nil to make no change.
+    dotSizeWorld = (nil or number >= 0 or function( ent ) return nil or number end), -- Resizes the dot so that its width on the minimap matches a distance in the world. nil to make no change.
+    findFunc = (nil or function() return { Entity, ... } end), -- Function to find entities of this type. Defaults to find.byClass( "class_name" ).
+    disabled = (nil or boolean or function() return bool end), -- Whether to disable this dot type. nil to always show.
+}
+--]]
+
+
+local VECTOR_UP = Vector( 0, 0, 1 )
+local VECTOR_UP_BIG = Vector( 0, 0, 60000 )
+
+local active = true
+local contextMenuOpen = false
+local oldChipName = chip():getChipName()
+local scrW, scrH = render.getGameResolution()
+local zoomLevelOriginal = libMeshMinimap.ZOOM_LEVEL
+local zoomLevel = zoomLevelOriginal
+local meshOffsetPreScaled = Vector()
+local mapDataReady = false
+local meshesReady = false
+local mapHoloBase = nil
+local mapHolos = nil
+local mapHoloBaseTint = nil
+local mapHolosTint = nil
+
+
+----- GLOBAL FUNCTIONS -----
+
+function libMeshMinimap.setActive( state )
+    active = state
+end
+
+function libMeshMinimap.isActive()
+    return active
+end
+
+-- Note that this doesn't check for the HUD being active or not.
+function libMeshMinimap.isVisible( ignoreActive )
+    if not active and not ignoreActive then return false end
+    if not meshesReady then return false end
+    if libMeshMinimap.HIDE_IN_CONTEXT_MENU and contextMenuOpen then return false end
+
+    if libMeshMinimap.HIDE_IN_TOOLGUN then
+        local wep = player():getActiveWeapon()
+        if isValid( wep ) and wep:getClass() == "gmod_tool" then return false end
+    end
+
+    return true
+end
+
+function libMeshMinimap.setZoomLevel( level )
+    if not meshesReady then error( "Meshes not ready" ) end
+    if type( level ) ~= "number" then error( "Expexted level to be a number" ) end
+
+    zoomLevel = level
+    local holoScale = Vector( zoomLevel / zoomLevelOriginal )
+
+    for _, mapHolo in ipairs( mapHolos ) do
+        mapHolo:setScale( holoScale )
+    end
+
+    for _, mapHolo in ipairs( mapHolosTint ) do
+        mapHolo:setScale( holoScale )
+    end
+end
+
+function libMeshMinimap.getZoomLevel()
+    return zoomLevel
+end
+
+-- Same as in libMapMesh, but accounts for the zoom level
+function libMeshMinimap.worldPosToMeshPos( worldPos )
+    return ( worldPos + meshOffsetPreScaled ) * zoomLevel
+end
+
+function libMeshMinimap.setCeilingTintColor( color )
+    libMeshMinimap.CEILING_TRACE_TINT_COLOR = color
+
+    if not meshesReady then return end
+
+    for _, mapHolo in ipairs( mapHolosTint ) do
+        mapHolo:setColor( color )
+    end
+end
+
+
+
+----- PRIVATE FUNCTIONS -----
+
+local dotPoly = polyTools.polyMakeCircleFilled( 0, 0, 1, libMeshMinimap.DOT_SIDES )
+local activeDots = {}
+local renderHeight = nil
+local progressFont = render.createFont( "Default", scrW * 40 / 1920, 400, true, false, false, true )
+local mapViewMatrix
+local arrowPoly
+local triUpPoly
+local triDownPoly
+local dotPointedPoly
+local compassEntries
+
+libMapMesh.MESH_SCALE_OVERRIDE = zoomLevel
+libMeshMinimap.compassFont = render.createFont( libMeshMinimap.COMPASS_FONT, scrW * libMeshMinimap.COMPASS_FONT_SIZE * libMeshMinimap.COMPASS_FONT_OUTLINE_THINNESS, libMeshMinimap.COMPASS_FONT_WEIGHT, libMeshMinimap.COMPASS_FONT_ANTIALIAS, false, false, libMeshMinimap.COMPASS_FONT_OUTLINE )
+
+
+local function resetStencil()
+    render.setStencilWriteMask( 0xFF )
+    render.setStencilTestMask( 0xFF )
+    render.setStencilReferenceValue( 0 )
+    render.setStencilCompareFunction( STENCIL.ALWAYS )
+    render.setStencilPassOperation( STENCIL.KEEP )
+    render.setStencilFailOperation( STENCIL.KEEP )
+    render.setStencilZFailOperation( STENCIL.KEEP )
+    render.clearStencil()
+end
+
+local function getMyPos()
+    if libMeshMinimap.USE_CALCVIEW then
+        return render.getEyePos()
+    else
+        return player():getEyePos()
+    end
+end
+
+local function getMyAng()
+    if libMeshMinimap.USE_CALCVIEW then
+        return render.getAngles()
+    else
+        return player():getEyeAngles()
+    end
+end
+
+local function dotSorter( a, b )
+    return a.priority < b.priority
+end
+
+local function drawDots( mmWidth, mmCenterX, mmCenterY )
+    local eyePos = getMyPos()
+    local eyeAng = getMyAng()
+    eyeAng[1] = 0
+    eyeAng[3] = 0
+
+    local entAng = Angle( 0, 0, 0 ) -- Avoid creation of extra angles
+    local dotSize = mmWidth * libMeshMinimap.DOT_SIZE
+    if dotSize == 0 then return end
+
+    local posScale = zoomLevel / dotSize -- Divide by dotSize so the dots still get enlarged but it doesn't mess with their positions
+    local heightColor = libMeshMinimap.DOT_HEIGHT_COLOR
+
+    local mapMatrix = Matrix()
+    mapMatrix:translate( Vector( mmCenterX, mmCenterY, 0 ) )
+    mapMatrix:scale( Vector( dotSize, dotSize, 1 ) )
+
+    local ringMatrix = Matrix()
+    ringMatrix:scale( Vector( 1 + libMeshMinimap.DOT_RING_THICKNESS ) )
+
+    render.pushMatrix( mapMatrix )
+
+    for _, dotSet in ipairs( activeDots ) do
+        local info = dotSet.info
+        local dotsForClass = dotSet.dotsForClass
+
+        local getPos = info.getPos or function( ent ) return ent:obbCenterW() end
+        local getYaw = info.getYaw
+
+        for _, dot in ipairs( dotsForClass ) do
+            local ent = dot.ent
+            if not isValid( ent ) then continue end
+
+            local pos = getPos( ent )
+            local yaw = getYaw and getYaw( ent )
+            entAng[2] = yaw or 0
+
+            local localPos, localAng = worldToLocal( pos, entAng, eyePos, eyeAng )
+            localPos[1] = localPos[1] * posScale
+            localPos[2] = localPos[2] * posScale
+
+            local ringColor = dot.ringColor
+            local dotScale = dot.dotScale
+            local posMatrix = Matrix()
+            posMatrix:translate( Vector( -localPos[2], -localPos[1], 0 ) )
+
+            if dotScale then
+                posMatrix:scale( dotScale )
+            end
+
+            render.pushMatrix( posMatrix )
+
+            if yaw then
+                local angMatrix = Matrix()
+                angMatrix:rotate( Angle( 0, -localAng[2], 0 ) )
+                render.pushMatrix( angMatrix )
+
+                if ringColor then
+                    render.pushMatrix( ringMatrix )
+                    render.setColor( ringColor )
+                    render.drawPoly( dotPointedPoly )
+                    render.popMatrix()
+                end
+
+                render.setColor( dot.color )
+                render.drawPoly( dotPointedPoly )
+
+                render.popMatrix()
+            else
+                if ringColor then
+                    render.pushMatrix( ringMatrix )
+                    render.setColor( ringColor )
+                    render.drawPoly( dotPoly )
+                    render.popMatrix()
+                end
+
+                render.setColor( dot.color )
+                render.drawPoly( dotPoly )
+            end
+
+            if dot.hasHeightDiff then
+                render.setColor( heightColor )
+                render.drawPoly( dot.isAbove and triUpPoly or triDownPoly )
+            end
+
+            render.popMatrix()
+        end
+    end
+
+    render.popMatrix()
+end
+
+local function drawCompass( mmWidth, mmCenterX, mmCenterY )
+    local compassMode = libMeshMinimap.COMPASS_MODE
+    if compassMode == 0 then return end
+
+    local eyeAng = getMyAng()
+    eyeAng[1] = 0
+    eyeAng[3] = 0
+
+    local fontSize = scrW * libMeshMinimap.COMPASS_FONT_SIZE
+    local textScale = Vector( 1 / libMeshMinimap.COMPASS_FONT_OUTLINE_THINNESS ) -- Base font is bigger then gets scaled down to change outline thickness
+    local radius = mmWidth * ( 1 + libMeshMinimap.BORDER_THICKNESS ) / 2 + fontSize / 2
+    local pos = Vector( 0, -radius, 0 )
+    local matrix
+
+    local mapMatrix = Matrix()
+    mapMatrix:translate( Vector( mmCenterX, mmCenterY, 0 ) )
+    mapMatrix:rotate( eyeAng )
+
+    render.setFont( libMeshMinimap.compassFont )
+    render.pushMatrix( mapMatrix )
+
+    for _, entry in ipairs( compassEntries[compassMode] ) do
+        local color = libMeshMinimap[entry.colorName]
+        render.setColor( color )
+
+        matrix = Matrix()
+        matrix:rotate( entry.rot )
+        matrix:translate( pos )
+        matrix:scale( textScale )
+
+        render.pushMatrix( matrix )
+        render.drawSimpleText( 0, 0, entry.text, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER )
+        render.popMatrix()
+    end
+
+    render.popMatrix()
+end
+
+
+----- SETUP -----
+
+hook.add( "DrawHUD", "LKL_MeshMinimap_DrawMinimap", function()
+    if not meshesReady then
+        -- Progress bar
+        local barWidth = scrW * 0.5
+        local barHeight = scrH * 0.05
+        local barX = ( scrW - barWidth ) / 2
+        local barY = scrH * 0.75
+        local border = barHeight * 0.1
+        local progress = libMapMesh.getMeshProgress()
+
+        render.setColor( c_gray )
+        render.drawRect( barX, barY, barWidth, barHeight )
+
+        render.setColor( Color( 120 * progress, 1, 1 ):hsvToRGB() )
+        render.drawRect( barX + border, barY + border, ( barWidth - border * 2 ) * progress, barHeight - border * 2 )
+
+        render.setColor( c_white )
+        render.setFont( progressFont )
+        render.drawSimpleText( scrW / 2, barY, "loading map mesh...", TEXT_ALIGN.CENTER, TEXT_ALIGN.BOTTOM )
+        render.drawRectOutline( barX, barY, barWidth, barHeight, border )
+
+        return
+    end
+
+    if not libMeshMinimap.isVisible() then return end
+
+    local mmWidth = scrW * libMeshMinimap.WIDTH
+    local mmWidthHalf = mmWidth / 2
+    local mmX = scrW * libMeshMinimap.X_POS
+    local mmY = ( libMeshMinimap.Y_POS_BY_WIDTH and scrW or scrH ) * libMeshMinimap.Y_POS
+    local mmCenterX = mmX + mmWidthHalf
+    local mmCenterY = mmY + mmWidthHalf
+
+    resetStencil()
+
+    -- Border
+    local borderThickness = libMeshMinimap.BORDER_THICKNESS
+
+    if borderThickness > 0 then
+        render.setColor( libMeshMinimap.BORDER_COLOR )
+        render.drawFilledCircle( mmCenterX, mmCenterY, mmWidthHalf + mmWidthHalf * borderThickness )
+    end
+
+    -- Draw a circle stencil to lock everything into
+    render.setStencilEnable( true )
+    render.setStencilPassOperation( STENCIL.REPLACE )
+    render.setStencilReferenceValue( 1 )
+
+    render.setColor( libMeshMinimap.BACKGROUND_COLOR )
+    render.drawFilledCircle( mmCenterX, mmCenterY, mmWidthHalf )
+
+    -- Only allow drawing inside the stencil
+    render.setStencilCompareFunction( STENCIL.EQUAL )
+    render.setStencilPassOperation( STENCIL.KEEP )
+
+    -- Draw the map
+    local eyeAng = getMyAng()
+    eyeAng[1] = 90
+    eyeAng[3] = 0
+
+    local ortho = mapViewMatrix.ortho
+    ortho.left = -mmWidthHalf
+    ortho.top = -mmWidthHalf
+    ortho.right = mmWidthHalf
+    ortho.bottom = mmWidthHalf
+
+    local eyePos = getMyPos()
+    local doCeilingTint = renderHeight and libMeshMinimap.CEILING_TRACE_TINT
+
+    if renderHeight and not doCeilingTint then
+        eyePos[3] = renderHeight
+    end
+
+    local meshPos = libMeshMinimap.worldPosToMeshPos( eyePos )
+
+    mapViewMatrix.origin = meshPos
+    mapViewMatrix.angles = eyeAng
+    mapViewMatrix.x = mmX
+    mapViewMatrix.y = mmY
+    mapViewMatrix.w = mmWidth
+    mapViewMatrix.h = mmWidth
+    render.pushViewMatrix( mapViewMatrix )
+
+    for _, holo in ipairs( mapHolos ) do
+        holo:draw()
+    end
+
+    render.popViewMatrix()
+    render.setMaterial()
+
+    if doCeilingTint then
+        eyePos[3] = renderHeight
+        mapViewMatrix.origin = libMeshMinimap.worldPosToMeshPos( eyePos )
+
+        render.clearDepth( false )
+        render.pushViewMatrix( mapViewMatrix )
+
+        for _, holo in ipairs( mapHolosTint ) do
+            holo:setClip( 1, true, meshPos, VECTOR_UP )
+            holo:draw()
+        end
+
+        render.popViewMatrix()
+    end
+
+    -- Draw dots
+    drawDots( mmWidth, mmCenterX, mmCenterY )
+
+    -- Client indicator
+    local arrowSize = mmWidth * libMeshMinimap.CLIENT_INDICATOR_SIZE
+
+    if arrowSize > 0 then
+        render.setColor( libMeshMinimap.CLIENT_INDICATOR_COLOR )
+        polyTools.drawPoly( arrowPoly, mmCenterX, mmCenterY, arrowSize, arrowSize )
+    end
+
+    render.setStencilEnable( false )
+
+    -- Draw compass
+    drawCompass( mmWidth, mmCenterX, mmCenterY )
+end )
+
+hook.add( "tick", "LKL_MeshMinimap_CeilingTrace", function()
+    if not libMeshMinimap.CEILING_TRACE then
+        renderHeight = nil
+
+        return
+    end
+
+    local eyePos = getMyPos()
+    local tr = trace.line( eyePos, eyePos + VECTOR_UP_BIG, nil, MASK.SHOT, COLLISION_GROUP.PASSABLE_DOOR )
+
+    if tr.StartSolid then
+        renderHeight = nil
+    else
+        renderHeight = tr.HitPos[3]
+    end
+end )
+
+hook.add( "LKL_MapMesh_AddExtraData", "LKL_MeshMinimap_GetMeshConstants", function()
+    mapDataReady = true
+end )
+
+hook.add( "LKL_MapMesh_MeshesReady", "LKL_MeshMinimap_MeshesReady", function()
+    timer.remove( "LKL_MeshMinimap_ShowProgress" )
+    setName( oldChipName )
+
+    meshOffsetPreScaled = libMapMesh.getMeshOffset() / zoomLevel
+
+    -- Spawn map holos
+    timer.create( "LKL_MeshMinimap_SpawnMapHolos", 0.5, 0, function()
+        if not mapHoloBase then
+            mapHoloBase, mapHolos = libMapMesh.createMeshHolos( Vector(), Angle(), nil )
+            if not mapHoloBase then return end
+        end
+
+        if not mapHoloBaseTint then
+            mapHoloBaseTint, mapHolosTint = libMapMesh.createMeshHolos( Vector(), Angle(), nil )
+            if not mapHoloBaseTint then return end
+        end
+
+        local ceilingTintColor = libMeshMinimap.CEILING_TRACE_TINT_COLOR
+
+        for _, holo in ipairs( mapHolos ) do
+            holo:setNoDraw( true )
+        end
+
+        for _, holo in ipairs( mapHolosTint ) do
+            holo:setNoDraw( true )
+            holo:setColor( ceilingTintColor )
+        end
+
+        meshesReady = true
+
+        timer.remove( "LKL_MeshMinimap_SpawnMapHolos" )
+        hook.run( "LKL_MeshMinimap_MapReady" )
+    end )
+end )
+
+hook.add( "OnContextMenuOpen", "LKL_MeshMinimap_OnContextMenuOpen", function()
+    contextMenuOpen = true
+end )
+
+hook.add( "OnContextMenuClose", "LKL_MeshMinimap_OnContextMenuClose", function()
+    contextMenuOpen = false
+end )
+
+
+timer.create( "LKL_MeshMinimap_StartLoading", 0.2, 0, function()
+    if not mapDataReady then return end
+    if not render.isHUDActive() then return end
+
+    if libMapMesh.startLoadingMeshes() then
+        timer.remove( "LKL_MeshMinimap_StartLoading" )
+
+        timer.create( "LKL_MeshMinimap_ShowProgress", 0.1, 0, function()
+            setName( oldChipName .. "\n(" .. math.round( libMapMesh.getMeshProgress() * 100 ) .. "%)" )
+        end )
+    end
+end )
+
+timer.create( "LKL_MeshMinimap_UpdateDots", libMeshMinimap.DOT_UPDATE_INTERVAL, 0, function()
+    if not render.isHUDActive() then return end
+    if not libMeshMinimap.isVisible() then return end
+
+    local baseDotSize = libMeshMinimap.DOT_SIZE
+
+    activeDots = {}
+
+    if baseDotSize <= 0 then return end
+
+    local perfLimit = cpuMax() * libMeshMinimap.DOT_PERF_LIMIT
+    local otherPerf = cpuTotalAverage() - cpuAverage()
+    perfLimit = perfLimit - otherPerf
+
+    local eyePos = getMyPos()
+    local eyeZ = eyePos[3]
+    local distLimit = scrW * libMeshMinimap.WIDTH / ( zoomLevel * 2 )
+    local heightTriangleDefault = libMeshMinimap.DOT_HEIGHT_TRIANGLE
+    local heightHideDefault = libMeshMinimap.DOT_HEIGHT_HIDE
+    local dotSizeWorldMult = zoomLevel / ( scrW * libMeshMinimap.WIDTH * baseDotSize * 2 )
+
+    for className, info in pairs( libMeshMinimap.DOT_TYPES ) do
+        if cpuAverage() > perfLimit then break end
+
+        local disabled = info.disabled
+
+        if disabled then
+            if type( disabled ) == "function" then
+                disabled = disabled()
+            end
+
+            if disabled then continue end
+        end
+
+        local dotsByPriority = {}
+        local priority = info.priority
+        local findFunc = info.findFunc
+        local ents = findFunc and findFunc() or find.byClass( className )
+        local color = info.color
+        local ringColor = info.ringColor
+        local requireLOS = info.requireLOS
+        local getPosLOS = info.getPosLOS or function( ent ) return ent:obbCenterW() end
+        local getPos = info.getPos or function( ent ) return ent:obbCenterW() end
+        local canShow = info.canShow
+        local heightTriangle = info.heightTriangle or heightTriangleDefault
+        local heightHide = info.heightHide or heightHideDefault
+        local dotScale = info.dotScale
+        local dotSize = info.dotSize
+        local dotSizeWorld = info.dotSizeWorld
+
+        local priorityIsFunc = type( priority ) == "function"
+        local colorIsFunc = type( color ) == "function"
+        local ringColorIsFunc = type( ringColor ) == "function"
+        local requireLOSIsFunc = type( requireLOS ) == "function"
+        local heightTriangleIsFunc = type( heightTriangle ) == "function"
+        local heightHideIsFunc = type( heightHide ) == "function"
+        local dotScaleIsFunc = type( dotScale ) == "function"
+        local dotSizeIsFunc = type( dotSize ) == "function"
+        local dotSizeWorldIsFunc = type( dotSizeWorld ) == "function"
+
+        if dotScale and not dotScaleIsFunc then dotScale = Vector( dotScale ) end
+        if dotSize and not dotSizeIsFunc then dotSize = Vector( dotSize / baseDotSize ) end
+        if dotSizeWorld and not dotSizeWorldIsFunc then dotSizeWorld = Vector( dotSizeWorld * dotSizeWorldMult ) end
+
+        for _, ent in ipairs( ents ) do
+            if cpuAverage() > perfLimit then break end
+            if canShow and not canShow( ent ) then continue end
+
+            local pos = getPos( ent )
+            local heightDiff = pos[3] - eyeZ
+            local heightDiffAbs = math.abs( heightDiff )
+            local heightHideEff = heightHide
+
+            if heightHideIsFunc then
+                heightHideEff = heightHide( ent ) or heightHideDefault
+            end
+
+            if heightHideEff > 0 and heightDiffAbs > heightHideEff then continue end
+            if ( pos - eyePos ):getLength2D() > distLimit then continue end
+
+            if requireLOS and ( not requireLOSIsFunc or requireLOS( ent ) ) then
+                local posLOS = getPosLOS( ent )
+                local tr = trace.line( eyePos, posLOS, nil, MASK.SHOT, COLLISION_GROUP.PASSABLE_DOOR )
+                if tr.Hit then continue end
+            end
+
+            local dotScaleEff
+            local heightTriangleEff = heightTriangle
+
+            if dotScale then
+                if dotScaleIsFunc then
+                    dotScaleEff = dotScale( ent )
+                    if dotScaleEff then dotScaleEff = Vector( dotScaleEff ) end
+                else
+                    dotScaleEff = dotScale
+                end
+            elseif dotSize then
+                if dotSizeIsFunc then
+                    dotScaleEff = dotSize( ent ) / baseDotSize
+                    if dotScaleEff then dotScaleEff = Vector( dotScaleEff / baseDotSize ) end
+                else
+                    dotScaleEff = dotSize
+                end
+            elseif dotSizeWorld then
+                if dotSizeWorldIsFunc then
+                    dotScaleEff = dotSizeWorld( ent )
+                    if dotScaleEff then dotScaleEff = Vector( dotScaleEff * dotSizeWorldMult ) end
+                else
+                    dotScaleEff = dotSizeWorld
+                end
+            end
+
+            if heightTriangleIsFunc then
+                heightTriangleEff = heightTriangle( ent ) or heightTriangleDefault
+            end
+
+            local priorityEff = priorityIsFunc and priority( ent ) or priority or 1000
+            local dots = dotsByPriority[priorityEff]
+
+            if not dots then
+                dots = {}
+                dotsByPriority[priorityEff] = dots
+            end
+
+            table.insert( dots, {
+                ent = ent,
+                color = colorIsFunc and color( ent ) or color,
+                ringColor = ringColorIsFunc and ringColor( ent ) or ringColor,
+                hasHeightDiff = heightTriangleEff ~= 0 and heightDiffAbs > heightTriangleEff,
+                isAbove = heightDiff > 0,
+                dotScale = dotScaleEff,
+            } )
+        end
+
+        for priorityEff, dots in pairs( dotsByPriority ) do
+            table.insert( activeDots, {
+                info = info,
+                priority = priorityEff,
+                dotsForClass = dots,
+            } )
+        end
+    end
+
+    table.sort( activeDots, dotSorter )
+end )
+
+
+mapViewMatrix = {
+    type = "3D",
+    znear = 0,
+    ortho = {},
+}
+
+arrowPoly = {
+    { x = 0, y = -0.5 },
+    { x = 0.5, y = 0.5 },
+    { x = 0, y = 0 },
+    { x = -0.5, y = 0.5 },
+}
+
+triUpPoly = polyTools.polyScale( {
+    { x = 0, y = -0.5 },
+    { x = 0.5, y = 0.5 },
+    { x = -0.5, y = 0.5 },
+}, 0.9 )
+
+triDownPoly = polyTools.polyScale( {
+    { x = 0, y = 0.5 },
+    { x = -0.5, y = -0.5 },
+    { x = 0.5, y = -0.5 },
+}, 0.9 )
+
+local dotPointedNarrowness = 0.75
+dotPointedPoly = polyTools.polyMakeCircleFilled( 0, 0, 1, math.ceil( libMeshMinimap.DOT_SIDES / 2 ), 180, 180 )
+dotPointedPoly = polyTools.polyScale( dotPointedPoly, dotPointedNarrowness, 1 )
+dotPointedPoly[1] = { x = 0, y = -1 }
+dotPointedPoly = polyTools.polyScale( polyTools.polyTranslate( dotPointedPoly, 0, -0.25 ), 1 / dotPointedNarrowness )
+
+compassEntries = {
+    [1] = {
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "N",
+            rot = Angle( 0, -90, 0 ), -- Should be 90, but have to invert the angles for the text to be upright
+        },
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "S",
+            rot = Angle( 0, 90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "E",
+            rot = Angle( 0, 0, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "W",
+            rot = Angle( 0, 180, 0 ),
+        },
+    },
+    [2] = {
+        {
+            colorName = "COMPASS_COLOR_Y",
+            text = "+Y",
+            rot = Angle( 0, -90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_Y",
+            text = "-Y",
+            rot = Angle( 0, 90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_X",
+            text = "+X",
+            rot = Angle( 0, 0, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_X",
+            text = "-X",
+            rot = Angle( 0, 180, 0 ),
+        },
+    },
+    [3] = {
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "N    ",
+            rot = Angle( 0, -90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "S    ",
+            rot = Angle( 0, 90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "E    ",
+            rot = Angle( 0, 0, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_NSEW",
+            text = "W    ",
+            rot = Angle( 0, 180, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_Y",
+            text = "   +Y",
+            rot = Angle( 0, -90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_Y",
+            text = "   -Y",
+            rot = Angle( 0, 90, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_X",
+            text = "   +X",
+            rot = Angle( 0, 0, 0 ),
+        },
+        {
+            colorName = "COMPASS_COLOR_X",
+            text = "   -X",
+            rot = Angle( 0, 180, 0 ),
+        },
+    }
+}

@@ -1,0 +1,243 @@
+--@name RT Sprite
+--@author shroobloom
+--@shared
+--@include sb/util.txt
+
+
+local Util = require("sb/util.txt")
+
+
+local RTSprite = class("RTSprite")
+RTSprite.Instances = {}
+RTSprite.RenderOrder = {}
+RTSprite.MaxRTs = 16 --Lower this number if you need to reserve RTs for yourself, the global max RT count is 20 by default.
+
+RTSprite.ScalingMode = {
+    -- Scales relative to the world (3d sprite appearance, appears smaller as you get farther away)
+    WORLD = 1,
+    
+    -- Scales relative to your screen (2d HUD element appearance, constant size on your screen)
+    SCREEN = 2
+}
+
+
+
+
+function RTSprite:initialize()
+    assert(CLIENT, "RTSprite can only be created client-side!")
+    
+    self.Parent = nil
+    self.Position = Vector()
+    self.Offset = Vector()
+    
+    self.ID = table.insert(RTSprite.Instances, self)
+    
+    self.Loaded = false
+    self:setIgnoreZ(false)
+    
+    table.insert(RTSprite.RenderOrder, self)
+    
+    self.RenderPriority = 1
+    
+    self.Holo = hologram.create( Vector(), Angle(), "models/holograms/plane.mdl" )
+    self.Holo:suppressEngineLighting(true)
+    self.Holo:setColor(Color(255,255,255,254))
+    self:setScale(1)
+    self.Holo:setFilterMag(1)
+    
+    self:setLoaded(false)
+    
+    --[[if #RTSprite.RenderOrder <= 20 then
+        self:setLoaded(true)
+    end]]
+    
+    self.ScalingMode = RTSprite.ScalingMode.WORLD
+    
+    if CLIENT then
+        RTSprite.Reorder()
+    end
+end
+
+
+function RTSprite:setLoaded( state )
+    if self.Loaded == state then return end
+    
+    self.Loaded = state
+    
+    self.Holo:setNoDraw(not state)
+    --self.Holo:setColor(state and Color(255,255,255) or Color(255,255,255,144))
+    
+    if self.Loaded then
+        render.createRenderTarget(self:getRenderTargetName())
+        
+        self.Material = material.create("VertexLitGeneric")
+        self.Material:setTextureRenderTarget("$basetexture", self:getRenderTargetName())
+        self.Material:setInt("$flags", self.IgnoreZ and 2097152 + 32768 or 0 )
+        self.Holo:setMaterial("!" .. self.Material:getName())
+    else
+        render.destroyRenderTarget(self:getRenderTargetName())
+        self.Material:destroy()
+        self.Material = nil
+    end
+end
+
+function RTSprite:getRenderTargetName()
+    return "sb_rtsprite_" .. self.ID
+end
+
+
+function RTSprite:setParent( ent )
+    self.Parent = ent
+    self.Holo:setParent(ent)
+end
+
+function RTSprite:getPos()
+    return (isValid(self.Parent) and self.Parent:localToWorld(self.Offset) or self.Offset) + self.Position
+end
+
+function RTSprite:setPos( vec )
+    self.Position = vec
+end
+
+function RTSprite:setOffset( vec )
+    self.Offset = vec
+end
+
+
+function RTSprite:setScale( s )
+    self.Scale = s
+end
+
+
+function RTSprite:setScalingMode( mode )
+    self.ScalingMode = mode
+end
+
+function RTSprite:setRotationMode( mode )
+    self.RotationMode = mode
+end
+
+function RTSprite:update( cb )
+    Util.modifyRenderTarget( self:getRenderTargetName(), function()
+        render.clear( Color(0,0,0,0) )
+        cb()
+    end)
+end
+
+function RTSprite:render()
+end
+
+function RTSprite:setIgnoreZ( state )
+    self.IgnoreZ = state
+    
+    if self.Loaded then
+        self.Material:setInt("$flags", state and 2097152 + 32768 or 0 )
+    end
+end
+
+
+function RTSprite:remove()
+    self.Holo:remove()
+    
+    if self.Loaded then
+        self.Material:destroy()
+        render.destroyRenderTarget(self:getRenderTargetName())
+    end
+    
+    RTSprite.Instances[self.ID] = nil
+    table.removeByValue(RTSprite.RenderOrder, self)
+end
+
+
+if CLIENT then
+    
+    -- leak detector
+    --[[timer.create("asdf", 1, 0, function()
+        local Loaded = 0
+        local Existing = 0
+        
+        for i,v in pairs(RTSprite.Instances) do
+            Existing = Existing + 1
+            
+            if v.Loaded then
+                Loaded = Loaded + 1
+            end
+        end
+        
+        print(Loaded, Existing)
+    end)]]
+    
+    function RTSprite.Reorder()
+        -- if it works it aint stupid
+        table.sort(RTSprite.RenderOrder, function( a, b )
+            return a:getPos():getDistance( render.getEyePos() ) / a.RenderPriority < b:getPos():getDistance( render.getEyePos() ) / b.RenderPriority
+        end)
+        
+        -- backwards so we unload before loading
+        for i=#RTSprite.RenderOrder, 1, -1 do
+            local self = RTSprite.RenderOrder[i]
+            self:setLoaded( i <= RTSprite.MaxRTs )
+        end
+    end
+    
+    timer.create("sb_rtsprite_reorder", 1, 0, RTSprite.Reorder)
+    
+    hook.add("renderoffscreen", "sb_rtsprite_render", function()
+        for i,self in pairs(RTSprite.RenderOrder) do
+            if not self.Loaded then break end
+            
+            local a = render.getAngles()
+            
+            self.Holo:setAngles( a + Angle( 90,0,180 ) )
+            
+            --[[ POSITION ]]--
+            self.Holo:setPos( self:getPos() )
+            
+            --[[ SCALE ]]--
+            local s = Vector()
+            
+            --TODO: screenscaling is a bit delayed
+            if self.ScalingMode == RTSprite.ScalingMode.WORLD then
+                s = self.Scale * 4
+            elseif self.ScalingMode == RTSprite.ScalingMode.SCREEN then
+                local dist = self:getPos():getDistance(render.getEyePos())
+                s = self.Scale * dist * 0.01
+            end
+            
+            if self.Holo:getScale().x ~= s then
+                self.Holo:setScale( Vector(s) )
+            end
+            
+            render.selectRenderTarget( self:getRenderTargetName() )
+            self:render()
+        end
+        
+        render.selectRenderTarget( nil )
+    end)
+end
+
+
+-- test
+--[[
+local test = RTSprite:new()
+test:setParent(chip())
+test:setPos(Vector(0,0,50))
+test:setOffset(Vector(0,0,25))
+--test:setScalingMode( RTSprite.ScalingMode.SCREEN )
+test:setRotationMode( RTSprite.RotationMode.HYBRID )
+test:setIgnoreZ( true )
+
+
+test:update(function()
+    
+    render.drawRect(0,0,512,512)
+    render.drawRect(512,512,512,512)
+    
+    render.setColor(Color(0,255,0))
+    render.drawRect(0,512,512,512)
+    
+end)]]
+
+
+return RTSprite
+

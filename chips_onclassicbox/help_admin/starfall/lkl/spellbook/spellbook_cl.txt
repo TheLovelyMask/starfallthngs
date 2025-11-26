@@ -1,0 +1,530 @@
+--@name spellbook_cl
+--@author legokidlogan and shrooblooms
+--@client
+
+local bookWidth = spellbook.BOOK_WIDTH
+local bookHeight = spellbook.BOOK_HEIGHT
+local bookDepth = spellbook.BOOK_DEPTH
+local pageInset = spellbook.PAGE_INSET
+local coverThickness = spellbook.COVER_THICKNESS
+local iconSize = spellbook.ICON_SIZE
+local iconAtTop = spellbook.ICON_AT_TOP
+
+local bookHolos = {}
+local bookHolosHidden = true
+local clothingHolos = {}
+local clothingHoloBases = {}
+local clothingHolosHidden = true
+local openEndTime = false
+local leftPageDirty = true
+local spellNameFontSize = 100
+local spellNameFont = render.createFont( "Default", spellNameFontSize, 400, true, false, false, false, false, false, false )
+local spellDescFontSize = 55
+local spellDescFont = render.createFont( "Default", spellDescFontSize, 400, true, false, false, false, false, false, false )
+local rtNamePageLeft = "LKL_Spellbook_PageLeft"
+local holoSpine = nil
+local holoCoverJointLeft = nil
+local holoCoverJointRight = nil
+local matLoadBank = {}
+local particleEmitters2D = {}
+local particleEmitters3D = {}
+local bookHolosReady = false
+
+local getMatObj
+local useParticleEmitter
+
+render.createRenderTarget( rtNamePageLeft )
+
+
+----- GLOBAL FUNCTIONS -----
+
+--[[
+    - Creates a 2D particle from an dynamic bank of emitters.
+    - mat can be a Material object or the string name of a loadable material.
+    - The remaining arguments are the same as in ParticleEmitter:add().
+    - Returns a Particle, or nil if the emitter limit has been reached.
+--]]
+function spellbook.create2DParticle( mat, ... )
+    return useParticleEmitter( false, mat, ... )
+end
+
+--[[
+    - Creates a 3D particle from an dynamic bank of emitters.
+    - mat can be a Material object or the string name of a loadable material.
+    - The remaining arguments are the same as in ParticleEmitter:add().
+    - Returns a Particle, or nil if the emitter limit has been reached.
+--]]
+function spellbook.create3DParticle( mat, ... )
+    return useParticleEmitter( true, mat, ... )
+end
+
+-- Whether or not the spellbook holos have been spawned.
+function spellbook.areBookHolosReady()
+    return bookHolosReady
+end
+
+--[[
+    - Once the spellbook holos are ready, will return a table of the following format:
+    {
+        spine = Hologram,
+        coverJointLeft = Hologram,
+        coverJointRight = Hologram,
+        coverLeft = Hologram,
+        coverRight = Hologram,
+        pageBlockLeft = Hologram,
+        pageBlockRight = Hologram,
+        pageLeft = Hologram,
+        pageRight = Hologram,
+
+        bookHolos = list of holos (including custom-added ones),
+        pageWidth = number,
+        pageHeight = number,
+        pageBlockThickness = number,
+        cubeModel = string,
+        spineOBB = Vector,
+        coverOBB = Vector,
+    }
+--]]
+function spellbook.getSpellbookHoloInfo()
+    return false
+end
+
+-- Creates a holo which will follow the owner while the spellbook is summoned and viewed from third-person.
+-- parent can either be a holo, or the string name of a bone.
+-- If provides, size will override scale.
+function spellbook.createClothingHolo( parent, localPos, localAng, model, scale, size )
+    if type( parent ) == "string" then
+        local boneID = owner():lookupBone( parent )
+        if not boneID then
+            print( "Spellbook: couldn't find a bone with the name '" .. parent .. "' on the owner." )
+
+            return spellbook.createClothingHolo( game.getWorld(), localPos, localAng, model, scale, size )
+        end
+
+        local baseHolo = clothingHoloBases[boneID]
+
+        if not baseHolo then
+            baseHolo = hologram.create( Vector(), Angle(), "models/hunter/plates/plate.mdl", Vector() )
+            baseHolo:setMaterial( "engine/writez" )
+            baseHolo:setColor( Color( 0, 0, 0, 0 ) )
+            baseHolo:setNoDraw( clothingHolosHidden )
+
+            clothingHoloBases[boneID] = baseHolo
+            table.insert( clothingHolos, baseHolo )
+        end
+
+        parent = baseHolo
+    end
+
+    local pos, ang = localToWorld( localPos, localAng, parent:getPos(), parent:getAngles() )
+    local holo = hologram.create( pos, ang, model, scale )
+    holo:setParent( parent )
+    holo:setNoDraw( clothingHolosHidden )
+
+    if size then
+        holo:setSize( size )
+    end
+
+    table.insert( clothingHolos, holo )
+
+    return holo
+end
+
+-- Approximates whether the book should be rendered in first-person mode or not.
+if player() == owner() then
+    function spellbook.isInFirstPerson()
+        return not player():shouldDrawLocalPlayer()
+    end
+else
+    function spellbook.isInFirstPerson()
+        return false
+    end
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+getMatObj = function( name )
+    if type( name ) == "string" then
+        local mat = matLoadBank[name]
+        if mat then return mat end
+
+        mat = material.load( name )
+        matLoadBank[name] = mat
+
+        return mat
+    end
+
+    return name
+end
+
+useParticleEmitter = function( is3D, mat, ... )
+    local bank = is3D and particleEmitters3D or particleEmitters2D
+    mat = getMatObj( mat )
+
+    -- Look for an emitter that has particles left.
+    for i, emitter in ipairs( bank ) do
+        if emitter:getParticlesLeft() > 0 then
+            -- Before using the emitter, check to see if any of the other emitters are empty and can be removed.
+            for i2 = #bank, i + 1, -1 do
+                local emitter2 = bank[i2]
+
+                if emitter2:getNumActiveParticles() <= 0 then
+                    emitter2:destroy()
+                    table.remove( bank, i2 )
+                end
+            end
+
+            return emitter:add( mat, ... ) -- Use the emitter.
+        end
+    end
+
+    -- All emitters are full, need to make a new one.
+    if particle.particleEmittersLeft() <= 0 then return end -- Unable to make another emitter.
+
+    local emitter = particle.create( Vector(), is3D )
+    table.insert( bank, emitter )
+
+    return emitter:add( mat, ... )
+end
+
+
+----- SETUP -----
+
+-- use renderoffscreen instead of think to eliminate book jittering. Runs just as often, but fixes hook order issues.
+hook.add( "renderoffscreen", "LKL_Spellbook_AnimateSpellbook", function()
+    if not bookHolosReady then return end
+    if not spellbook.summoned then return end
+
+    local wasOpen = spellbook.open
+    local open = spellbook.shouldBookBeOpen()
+    local now = timer.curtime()
+
+    if open ~= wasOpen then
+        openEndTime = open and ( now + spellbook.OPEN_DURATION ) or ( now + spellbook.CLOSE_DURATION )
+        spellbook.open = open
+
+        if player() == owner() and not open then
+            local spell = spellbook.getSelectedSpell()
+
+            spell:onBookClosed()
+        end
+
+        hook.run( "LKL_Spellbook_OnOpenChanged", open )
+    end
+
+    local isFirstPerson = spellbook.isInFirstPerson()
+    local bookPos, bookAng, frac = spellbook.calcBookPosAng( openEndTime, isFirstPerson )
+
+    holoSpine:setPos( bookPos )
+    holoSpine:setAngles( bookAng )
+
+    -- On the owner's client, make the sound holo be locked exactly to the eye pos so it doesn't lag behind.
+    if player() == owner() then
+        local ownerSoundHolo = spellbook.getOwnerSoundHolo()
+        local wasHidden = bookHolosHidden
+
+        if isValid( ownerSoundHolo ) then
+            ownerSoundHolo:setPos( player():getShootPos() )
+        end
+
+        bookHolosHidden = not spellbook.isVisible()
+
+        if bookHolosHidden ~= wasHidden then
+            for _, holo in ipairs( bookHolos ) do
+                holo:setNoDraw( bookHolosHidden )
+            end
+        end
+    end
+
+    hook.run( "LKL_Spellbook_AnimateSpellbook", bookPos, bookAng, frac )
+
+    if not openEndTime then return end
+
+    if frac == 1 then
+        openEndTime = false
+    end
+
+    if not open then
+        frac = 1 - frac
+    end
+
+    local theta = frac * spellbook.OPEN_ANGLE
+
+    holoCoverJointLeft:setLocalAngles( Angle( 0, -theta, 0 ) )
+    holoCoverJointRight:setLocalAngles( Angle( 0, theta, 0 ) )
+end )
+
+hook.add( "renderoffscreen", "LKL_Spellbook_AnimateClothing", function()
+    local wasHidden = clothingHolosHidden
+    clothingHolosHidden = not spellbook.summoned or not owner():isAlive() or spellbook.isInFirstPerson() or not spellbook.isVisible()
+
+    if clothingHolosHidden ~= wasHidden then
+        for _, holo in ipairs( clothingHolos ) do
+            holo:setNoDraw( clothingHolosHidden )
+        end
+    end
+
+    if clothingHolosHidden then return end
+
+    for boneID, baseHolo in pairs( clothingHoloBases ) do
+        local pos, ang = owner():getBonePosition( boneID )
+        baseHolo:setPos( pos )
+        baseHolo:setAngles( ang )
+    end
+end )
+
+hook.add( "LKL_Spellbook_OnSetSummoned", "LKL_Spellbook_AnimateSpellbook", function( summoned )
+    local hide = not ( summoned and spellbook.isVisible() )
+
+    for _, holo in ipairs( bookHolos ) do
+        holo:setNoDraw( hide )
+    end
+
+    if not bookHolosReady then return end
+
+    -- Make sure the book is visually closed, as changing the summon state forces the book to close without being animated.
+    holoCoverJointLeft:setLocalAngles( Angle( 0, 0, 0 ) )
+    holoCoverJointRight:setLocalAngles( Angle( 0, 0, 0 ) )
+end )
+
+hook.add( "LKL_Spellbook_OnSetVisibility", "LKL_Spellbook_AnimateSpellbook", function()
+    local hide = not ( spellbook.summoned and spellbook.isVisible() )
+    bookHolosHidden = hide
+
+    for _, holo in ipairs( bookHolos ) do
+        holo:setNoDraw( hide )
+    end
+end )
+
+hook.add( "LKL_Spellbook_OnSpellSelected", "LKL_Spellbook_DirtyPage", function()
+    leftPageDirty = true
+end )
+
+hook.add( "LKL_Spellbook_Spell_IconLoaded", "LKL_Spellbook_DirtyPage", function( spellID )
+    if spellID ~= spellbook.selectedSpellID then return end
+
+    leftPageDirty = true
+end )
+
+hook.add( "LKL_Spellbook_Spell_NameChanged", "LKL_Spellbook_DirtyPage", function( spellID )
+    if spellID ~= spellbook.selectedSpellID then return end
+
+    leftPageDirty = true
+end )
+
+hook.add( "LKL_Spellbook_Spell_DescriptionChanged", "LKL_Spellbook_DirtyPage", function( spellID )
+    if spellID ~= spellbook.selectedSpellID then return end
+
+    leftPageDirty = true
+end )
+
+hook.add( "LKL_Spellbook_Spell_ColorChanged", "LKL_Spellbook_DirtyPage", function( spellID )
+    if spellID ~= spellbook.selectedSpellID then return end
+
+    leftPageDirty = true
+end )
+
+hook.add( "LKL_Spellbook_Spell_AssociatedModelCountChanged", "LKL_Spellbook_DirtyPage", function( spellID )
+    if spellID ~= spellbook.selectedSpellID then return end
+
+    leftPageDirty = true
+end )
+
+hook.add( "renderoffscreen", "LKL_Spellbook_DrawLeftPage", function()
+    if not leftPageDirty then return end
+    if not bookHolosReady then return end
+
+    leftPageDirty = false
+
+    local spell = spellbook.getSelectedSpell()
+    local yOffIcon = iconAtTop and ( iconSize + 40 - 10 ) or 0
+
+    render.selectRenderTarget( rtNamePageLeft )
+
+    render.clear( spellbook.PAGE_COLOR )
+
+    -- Name
+    local nameLines = string.split( spell:getName(), "\n" )
+
+    render.setFont( spellNameFont )
+    render.setColor( spell:getColorRGB() )
+
+    for i, line in ipairs( nameLines ) do
+        render.drawSimpleText( 512, 10 + yOffIcon + ( i - 1 ) * spellNameFontSize, line, TEXT_ALIGN.CENTER, TEXT_ALIGN.TOP )
+    end
+
+    local descLines = spell:getDescriptionLines()
+    local y = spellNameFontSize * #nameLines + 10 + 10 + yOffIcon
+    local yStep = spellDescFontSize + 5
+
+    -- Description
+    render.setFont( spellDescFont )
+    render.setRGBA( 0, 0, 0, 255 )
+
+    for _, line in ipairs( descLines ) do
+        render.drawSimpleText( 512, y, line, TEXT_ALIGN.CENTER, TEXT_ALIGN.TOP )
+        y = y + yStep
+    end
+
+    -- Icon
+    local iconRT = spell._iconRT
+
+    if iconRT then
+        y = iconAtTop and 40 or ( y + 20 )
+
+        render.setRenderTargetTexture( iconRT )
+        render.setColor( spell:getColorRGB() )
+        render.drawTexturedRectUV( 512 - iconSize / 2, y, iconSize, iconSize, spell._iconU0, spell._iconV0, spell._iconU1, spell._iconV1 )
+    end
+
+    -- Model associations
+    local modelAssByNiceName = spell:getAssociatedModelCounts()
+    local modelAssNames = spell._modelAssociationOrder
+    local wAccum = 0
+    local textAccum = ""
+    local lines = {}
+    y = 1024 - 10 - spellDescFontSize / 2
+    yStep = spellDescFontSize + 5
+
+    render.setMaterial()
+    render.setRGBA( 0, 0, 0, 255 )
+
+    for _, niceName in ipairs( modelAssNames ) do
+        local count = modelAssByNiceName[niceName]
+        local str = niceName .. ": " .. count .. " "
+        local w = render.getTextSize( str )
+
+        if wAccum + w > 1024 - 20 then
+            table.insert( lines, string.sub( textAccum, 1, -2 ) )
+            textAccum = ""
+            wAccum = 0
+            y = y - yStep
+        end
+
+        textAccum = textAccum .. str
+        wAccum = wAccum + w
+    end
+
+    if #textAccum > 0 then
+        table.insert( lines, string.sub( textAccum, 1, -2 ) )
+    end
+
+    for i, line in ipairs( lines ) do
+        render.drawSimpleText( 512, y + ( i - 1 ) * yStep, line, TEXT_ALIGN.CENTER, TEXT_ALIGN.BOTTOM )
+    end
+
+    render.selectRenderTarget()
+end )
+
+net.receive( "LKL_Spellbook_OwnerRespawned", function()
+    hook.run( "LKL_Spellbook_OwnerRespawned", net.readFloat() )
+end )
+
+net.receive( "LKL_Spellbook_OwnerDeath", function()
+    hook.run( "LKL_Spellbook_OwnerDeath", net.readFloat() )
+end )
+
+
+-- Make the book holos.
+hook.add( "LKL_Spellbook_AllSpellsLoaded", "LKL_Spellbook_Client_MakeBookHolos", function()
+    hook.remove( "LKL_Spellbook_AllSpellsLoaded", "LKL_Spellbook_Client_MakeBookHolos" )
+
+    local spineOBB = Vector( coverThickness, bookDepth, bookHeight )
+    local coverOBB = Vector( coverThickness, bookWidth, bookHeight )
+    local pageWidth = bookWidth - pageInset * 2
+    local pageHeight = bookHeight - pageInset * 2
+    local pageBlockThickness = bookDepth / 2 - coverThickness
+    local cubeModel = "models/holograms/cube.mdl"
+
+    holoSpine = hologram.create( Vector(), Angle(), cubeModel )
+    holoSpine:setSize( spineOBB )
+    table.insert( bookHolos, holoSpine )
+
+    holoCoverJointLeft = hologram.create( Vector( -coverThickness / 2, bookDepth / 2 - coverThickness, 0 ), Angle(), cubeModel, Vector( 0 ) )
+    holoCoverJointLeft:setParent( holoSpine )
+    table.insert( bookHolos, holoCoverJointLeft )
+
+    holoCoverJointRight = hologram.create( Vector( -coverThickness / 2, -bookDepth / 2 + coverThickness, 0 ), Angle(), cubeModel, Vector( 0 ) )
+    holoCoverJointRight:setParent( holoSpine )
+    table.insert( bookHolos, holoCoverJointRight )
+
+    local holoCoverLeft = hologram.create( Vector( -coverThickness / 2 - bookWidth / 2, bookDepth / 2 - coverThickness / 2, 0 ), Angle( 0, 90, 0 ), cubeModel )
+    holoCoverLeft:setSize( coverOBB )
+    holoCoverLeft:setParent( holoCoverJointLeft )
+    table.insert( bookHolos, holoCoverLeft )
+
+    local holoCoverRight = hologram.create( Vector( -coverThickness / 2 - bookWidth / 2, -bookDepth / 2 + coverThickness / 2, 0 ), Angle( 0, -90, 0 ), cubeModel )
+    holoCoverRight:setSize( coverOBB )
+    holoCoverRight:setParent( holoCoverJointRight )
+    table.insert( bookHolos, holoCoverRight )
+
+    local holoPageBlockLeft = hologram.create( holoCoverLeft:getPos() + Vector( 0, -coverThickness / 2 - pageBlockThickness / 2, 0 ), Angle( 0, -90, 0 ), cubeModel )
+    holoPageBlockLeft:setSize( Vector( pageBlockThickness, pageWidth, pageHeight ) )
+    holoPageBlockLeft:setParent( holoCoverJointLeft )
+    table.insert( bookHolos, holoPageBlockLeft )
+
+    local holoPageBlockRight = hologram.create( holoCoverRight:getPos() + Vector( 0, coverThickness / 2 + pageBlockThickness / 2, 0 ), Angle( 0, 90, 0 ), cubeModel )
+    holoPageBlockRight:setSize( Vector( pageBlockThickness, pageWidth, pageHeight ) )
+    holoPageBlockRight:setParent( holoCoverJointRight )
+    table.insert( bookHolos, holoPageBlockRight )
+
+    local holoPageLeft = hologram.create( holoPageBlockLeft:getPos() + Vector( 0, -pageBlockThickness / 2, 0 ), Angle( 0, -90, 0 ), cubeModel )
+    holoPageLeft:setSize( Vector( 0.1, pageWidth * 0.95, pageHeight * 0.95 ) )
+    holoPageLeft:setParent( holoPageBlockLeft )
+    table.insert( bookHolos, holoPageLeft )
+
+    local holoPageRight = hologram.create( holoPageBlockRight:getPos() + Vector( 0, pageBlockThickness / 2, 0 ), Angle( 0, 90, 0 ), cubeModel )
+    holoPageRight:setSize( Vector( 0.1, pageWidth * 0.95, pageHeight * 0.95 ) )
+    holoPageRight:setParent( holoPageBlockRight )
+    table.insert( bookHolos, holoPageRight )
+
+    for _, holo in ipairs( bookHolos ) do
+        holo:setMaterial( spellbook.COVER_MATERIAL )
+        holo:setColor( spellbook.COVER_COLOR )
+    end
+
+    local matPageLeft = material.create( "VertexLitGeneric" )
+    matPageLeft:setTextureRenderTarget( "$basetexture", rtNamePageLeft )
+
+    holoPageBlockLeft:setMaterial( spellbook.PAGE_MATERIAL )
+    holoPageBlockLeft:setColor( spellbook.PAGE_COLOR )
+    holoPageBlockRight:setMaterial( spellbook.PAGE_MATERIAL )
+    holoPageBlockRight:setColor( spellbook.PAGE_COLOR )
+    holoPageLeft:setMaterial( "!" .. matPageLeft:getName() )
+    holoPageLeft:setColor( Color( 255, 255, 255, 255 ) )
+
+    holoPageRight:setMaterial( spellbook.PAGE_MATERIAL )
+    holoPageRight:setColor( spellbook.PAGE_COLOR )
+
+    spellbook.getSpellbookHoloInfo = function()
+        return {
+            spine = holoSpine,
+            coverJointLeft = holoCoverJointLeft,
+            coverJointRight = holoCoverJointRight,
+            coverLeft = holoCoverLeft,
+            coverRight = holoCoverRight,
+            pageBlockLeft = holoPageBlockLeft,
+            pageBlockRight = holoPageBlockRight,
+            pageLeft = holoPageLeft,
+            pageRight = holoPageRight,
+
+            bookHolos = bookHolos,
+            pageWidth = pageWidth,
+            pageHeight = pageHeight,
+            pageBlockThickness = pageBlockThickness,
+            cubeModel = cubeModel,
+            spineOBB = spineOBB,
+            coverOBB = coverOBB,
+        }
+    end
+
+    bookHolosReady = true
+
+    local info = spellbook.getSpellbookHoloInfo()
+    hook.run( "LKL_Spellbook_SpellbookHolosCreated", info, bookHolos )
+
+    for _, holo in ipairs( bookHolos ) do
+        holo:setNoDraw( spellbook.summoned )
+    end
+end )

@@ -1,0 +1,126 @@
+--@name Extra Timers
+--@author legokidlogan
+--@shared
+
+-- Set to an integer x > 1 to make extra timers only evaluate on every x'th tick.
+extraTimerPrecision = math.max( math.floor( extraTimerPrecision or 1 ), 1 )
+
+
+if timer.existsExtra then return end -- Don't run twice
+
+local curtime = timer.curtime
+local tableKeyFromValue = table.keyFromValue
+local tableRemove = table.remove
+
+local precisionState = 0
+local timerCount = 0
+local timerCountSimple = 0
+local timers = {}
+local timerNames = {}
+local timerExistances = {}
+local timersSimple = {}
+
+
+function timer.existsExtra( name )
+    if not name then return false end
+
+    return timerExistances[name] or false
+end
+
+function timer.simpleExtra( gap, func )
+    if not gap or not func then return end
+
+    timerCountSimple = timerCountSimple + 1
+    timersSimple[timerCountSimple] = {
+        Trigger = curtime() + gap,
+        Func = func,
+    }
+end
+
+function timer.createExtra( name, gap, numRepeats, func )
+    if not name or not gap or not numRepeats or not func then return end
+
+    local exists = timerExistances[name]
+    local ind = exists and tableKeyFromValue( timerNames, name )
+
+    if not ind then
+        timerCount = timerCount + 1
+        ind = timerCount
+    end
+
+    timerNames[ind] = name
+    timerExistances[name] = true
+    timers[ind] = {
+        Name = name,
+        Gap = gap,
+        NextTrigger = curtime() + gap,
+        RemainingCalls = numRepeats,
+        Func = func,
+    }
+end
+
+function timer.removeExtra( name )
+    if not name or not timerExistances[name] then return end
+
+    local ind = tableKeyFromValue( timerNames, name )
+
+    timerCount = timerCount - 1
+    timerExistances[name] = nil
+    tableRemove( timers, ind )
+    tableRemove( timerNames, ind )
+end
+
+
+hook.add( "think", "LKL_ExtraTimers_ProcessTimers", function()
+    if extraTimerPrecision ~= 1 then
+        precisionState = precisionState + 1
+
+        if precisionState < extraTimerPrecision then return end
+
+        precisionState = 0
+    end
+
+    local now = curtime()
+
+    for i = timerCountSimple, 1, -1 do
+        local timerData = timersSimple[i]
+
+        if now >= timerData.Trigger then
+            timerData.Func()
+
+            timerCountSimple = timerCountSimple - 1
+            tableRemove( timersSimple, i )
+        end
+    end
+
+    for i = timerCount, 1, -1 do
+        local timerData = timers[i]
+
+        -- timerData can be nil if one of the previous timers in this loop called timer.removeExtra()
+        if timerData and now >= timerData.NextTrigger then
+            local remCalls = timerData.RemainingCalls
+            local canRepeat = true
+
+            if remCalls > 0 then
+                remCalls = remCalls - 1
+
+                if remCalls > 0 then
+                    timerData.RemainingCalls = remCalls
+                else
+                    canRepeat = false
+                end
+            end
+
+            timerData.Func()
+
+            if canRepeat then
+                timerData.NextTrigger = now + timerData.Gap
+            else
+                timerCount = timerCount - 1
+                timerExistances[timerData.Name] = nil
+                tableRemove( timers, i )
+                tableRemove( timerNames, i )
+            end
+        end
+    end
+end )

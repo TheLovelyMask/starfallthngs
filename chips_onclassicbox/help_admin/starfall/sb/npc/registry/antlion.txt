@@ -1,0 +1,311 @@
+--@name Antlion Registry
+--@author shroobloom
+--@shared
+--@include sb/e2vm.txt
+--@include sb/util.txt
+--@include sb/spawner.txt
+--@include sb/zone.txt
+
+
+if SERVER then
+    local Util = require("sb/util.txt")
+    local Spawner = require("sb/spawner.txt")
+    local E2VM = require("sb/e2vm.txt")
+    local Zone = require("sb/zone.txt")
+    
+    local Burrow
+    
+    Spawner.enqueue(function()
+        Burrow = E2VM:new([[
+@name Expression 2 Virtual Machine
+@inputs Antlion:entity
+@trigger Antlion
+
+if (Antlion) {
+    Antlion:entSetKeyValue( "StartBurrowed", 1 )
+}
+        ]])
+    end)
+    
+    
+    
+    
+    local function antlionUnburrow( npc )
+        if not Burrow then return end
+        
+        npc:setColor(Color(0,0,0,0))
+        Burrow:fireInput( "Antlion", npc )
+        
+        Util.wait(0.5)
+        if not npc:isValid() then return end
+        
+        npc:fireInput("burrow")
+        
+        Util.wait(1.5)
+        if not npc:isValid() then return end
+        
+        npc:setColor(Color(255,255,255,255))
+        npc:fireInput("unburrow")
+        
+    end
+    
+    
+    
+    -- Prevent Antlion Guards from trampling Antlions
+    hook.add("EntityTakeDamage", "antlion_blockTrample", function( victim, attacker )
+        if not victim.IsChipNPC or not attacker.IsChipNPC then return end
+        if victim:getClass() ~= "npc_antlion" or attacker:getClass() ~= "npc_antlionguard" then return end
+        
+        return true
+    end)
+    
+    
+    
+    local function setupAntlionGuard( npc )
+        npc.LastPos = npc:getPos()
+        npc.Charging = false
+    end
+    
+    
+    
+    return function( NPC )
+        
+        local function runAntlionGuardChargeAnticipation( npc )
+            local speed = (npc:getPos() - npc.LastPos):getLength()/0.25
+            npc.LastPos = npc:getPos()
+            
+            local nowCharging = speed >= 330
+            
+            if nowCharging ~= npc.Charging then
+                npc.Charging = nowCharging
+                npc:setNocollideAll(nowCharging)
+            end
+            
+            if nowCharging then
+                -- anticipate a collision:
+                local nearbyPlayer = false
+                
+                for i,v in pairs(NPC.Participants) do
+                    if v:getPos():getDistance( npc:getPos() ) < 200 then
+                        npc:setNocollideAll(false)
+                        nearbyPlayer = true
+                    end
+                end
+                
+                if not nearbyPlayer then
+                    npc:setNocollideAll(true)
+                end
+            end
+        end
+        
+        
+        NPC:register("Antlion", {
+            Name = "Antlion",
+            Class = "npc_antlion",
+            BoxSize = Vector(32, 32, 64),
+            
+            SpawnObscured = false,
+            Spawn = antlionUnburrow,
+        })
+        
+        NPC:register("AntlionWorker", {
+            Name = "Antlion Worker",
+            Class = "npc_antlion_worker",
+            BoxSize = Vector(32, 32, 64),
+            
+            SpawnObscured = false,
+            Spawn = antlionUnburrow,
+        })
+        
+        
+        NPC:register("AntlionGuard", {
+            Name = "Antlion Guard",
+            Class = "npc_antlionguard",
+            BoxSize = Vector(80, 80, 100),
+            
+            Health = 410,
+            
+            SpawnObscured = false,
+            Spawn = function( npc )
+                setupAntlionGuard( npc )
+                antlionUnburrow( npc )
+            end,
+
+            DefaultAsBoss = false,
+            BossVariant = {
+                Health = 2200,
+                Scale = 1.5,
+                DamageMultiplier = 3
+            },
+            
+            Abilities = {
+                {
+                    Cooldown = 0.25,
+                    Use = runAntlionGuardChargeAnticipation
+                }
+            }
+        })
+        
+        NPC:register("AntlionGuardian", {
+            Name = "Antlion Guardian",
+            Class = "npc_antlionguardian",
+            BoxSize = Vector(80, 80, 100),
+            
+            Health = 340,
+            
+            SpawnObscured = false,
+            Spawn = function( npc )
+                setupAntlionGuard( npc )
+                antlionUnburrow( npc )
+            end,
+
+            DefaultAsBoss = false,
+            BossVariant = {
+                Health = 1800,
+                Scale = 1.5,
+                DamageMultiplier = 3
+            },
+            
+            Abilities = {
+                {
+                    Cooldown = 0.25,
+                    Use = runAntlionGuardChargeAnticipation
+                }
+            }
+        })
+        
+        
+        NPC:register("ArmoredAntlion", {
+            Name = "Armored Antlion",
+            Class = "npc_antlion",
+            BoxSize = Vector(32, 32, 64),
+            
+            Scale = 1.5,
+            Health = 200,
+            DamageMultiplier = 10,
+            
+            Material = "models/combine_advisor/hose",
+            
+            SpawnObscured = false,
+            Spawn = function(npc)
+                npc:fireInput("DisableJump", 1)
+                antlionUnburrow(npc)
+            end,
+            
+            Attack = function( npc, victim )
+                npc:emitSound("npc/manhack/grind_flesh" .. math.random(1,3) .. ".wav")
+            end,
+            
+            TakeDamage = function( npc, attacker, inflictor, amount, dmgType, pos, force )
+                if dmgType ~= DAMAGE.BLAST then
+                    
+                    if effect.canCreate() then
+                        --[[local ef = effect.create()
+                        ef:setOrigin(pos)
+                        ef:play("MetalSpark")]]
+                        
+                        local ef = effect.create()
+                        ef:setOrigin(pos)
+                        ef:setNormal(-force:getNormalized())
+                        ef:setScale(20)
+                        ef:play("StunstickImpact")
+                    end
+                    
+                    npc:emitSound("physics/metal/metal_sheet_impact_bullet1.wav")
+                    
+                    return amount*0.1
+                end
+            end,
+
+            DefaultAsBoss = false,
+            BossVariant = {
+                Health = 2000,
+                Scale = 3,
+                DamageMultiplier = 30
+            }
+        })
+        
+        
+        NPC:register("FireAnt", {
+            Name = "Fire Ant",
+            Class = "npc_antlionguard",
+            BoxSize = Vector(80, 80, 100),
+            Scale = 0.75,
+            
+            Health = 250,
+            
+            Material = "models/combine_soldier/combinesoldiersheet_shotgun",
+            
+            DefaultAsBoss = false,
+            BossVariant = {
+                Health = 2000,
+                DamageMultiplier = 2,
+                Scale = 1.5
+            },
+
+            SpawnObscured = false,
+            Spawn = function( npc )
+                setupAntlionGuard( npc )
+                antlionUnburrow( npc )
+            end,
+            
+            TakeDamage = function( npc, attacker, inflictor, amount, dmgType )
+                if bit.band(dmgType, DAMAGE.BURN) ~= 0 then return true end
+            end,
+            
+            Attack = function( npc, victim, inflictor, amount, dmgType )
+                if bit.band(dmgType, DAMAGE.BURN) ~= 0 or not isValid(victim) or not victim:isPlayer() then return end
+                
+                victim:ignite( 2 )
+                NPC.applyDamage( victim, 25, npc, DAMAGE.BURN )
+            end,
+            
+            Abilities = {
+                {
+                    -- Spawn fire trail
+                    Cooldown = 0.25,
+                    Use = function( npc )
+                        local wasCharging = npc.Charging
+                        
+                        runAntlionGuardChargeAnticipation( npc )
+                        
+                        if wasCharging ~= npc.Charging then
+                            if npc.Charging then
+                                npc:ignite(300)
+                            else
+                                npc:ignite(0)
+                            end
+                        end
+                        
+                        if not npc.Charging then return end
+                        
+                        
+                        local vis = hologram.create(npc:getPos(), Angle(0,math.random()*360,0), "models/hunter/plates/plate3x3.mdl", Vector(1,1,1))
+                        vis:ignite(99999)
+                        vis:setColor(Color(0,0,0,0))
+                        
+                        local aabbMin, aabbMax = vis:worldSpaceAABB()
+                        
+                        local hurtBox = Zone:new( aabbMin - Vector(0,0,10), aabbMax + Vector(0,0,100) )
+                        
+                        function hurtBox:onPlayerEntered( plr )
+                            NPC.applyDamage( plr, 25 * NPC.GlobalDamageMultiplier * (npc.DamageMultiplier or 1), isValid(npc) and npc or vis, DAMAGE.BURN )
+                        end
+                        
+                        function hurtBox:onPlayerLingered( plr, dt )
+                            plr:ignite( 1 ) --TODO: remove then enter hurtbox, see if errors
+                            NPC.applyDamage( plr, 25 * dt * NPC.GlobalDamageMultiplier * (npc.DamageMultiplier or 1), isValid(npc) and npc or vis, DAMAGE.BURN )
+                        end
+                        
+                        timer.simple(7, function()
+                            hurtBox:remove()
+                            if isValid(vis) then vis:remove() end
+                        end)
+                    end
+                }
+            }
+        })
+        
+    end
+    
+end

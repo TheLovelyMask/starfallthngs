@@ -1,0 +1,66 @@
+--@name Measuring Stick
+--@author legokidlogan
+--@client
+--@include lkl/point_selector.txt
+--@include lkl/easy_print.txt
+--@include lkl/bulletlist.txt
+
+if player() ~= owner() then return end
+
+pointSelector = pointSelector or {}
+
+require( "lkl/easy_print.txt" )
+require( "lkl/bulletlist.txt" )
+
+
+-- CONFIG:
+local decimalPlaces = 3
+-- See lkl/point_selector.txt for more config options.
+    -- They can be edited here by doing  pointSelector.OPTION_NAME = value
+-- END CONFIG
+
+
+require( "lkl/point_selector.txt" )
+
+local selectedPointPos = nil
+
+
+hook.add( "LKL_PointSelector_PointSelected", "LKL_MeasuringStick_Measure", function( pos )
+    if not selectedPointPos then
+        selectedPointPos = pos
+
+        return
+    end
+
+    local delta = pos - selectedPointPos
+    local dist = math.round( delta:getLength(), decimalPlaces )
+    delta:round( decimalPlaces )
+
+    local printTbl = table.add( easyPrint.chipNamePrefix( nil, "[MeasuringStick]" ), {
+        c_white, "Results:\n"
+    } )
+
+    table.add( printTbl, easyPrint.bulletList( nil, BulletList:createFromTable( {
+            {
+                Contents = {
+                    c_white, "Distance: ",
+                    c_yellow, tostring( dist ),
+                },
+            },
+            {
+                Contents = table.add( {
+                    c_white, "Delta: ",
+                }, easyPrint.vector( nil, delta, decimalPlaces ) ),
+            },
+        } )
+    ) )
+
+    print( unpack( printTbl ) )
+
+    selectedPointPos = nil
+    pointSelector.clearSelectedPoints()
+end )
+
+hook.add( "LKL_PointSelector_SelectedPointsCleared", "LKL_MeasuringStick_Clear", function()
+    selectedPointPos = nil
+end )

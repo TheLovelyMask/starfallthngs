@@ -1,0 +1,481 @@
+--@name Enhanced First Person
+--@author legokidlogan
+--@client
+--@include lkl/cl_check_permissions.txt
+--@include lkl/fancy_input.txt
+--@include lkl/key_globalizer.txt
+
+require( "lkl/fancy_input.txt" )
+require( "lkl/key_globalizer.txt" )
+
+
+-- CONFIG:
+-- Note: camPos offset will adjust your view in this manner:
+    -- X - Forwards/backwards along aimDir
+    -- Y - Right/left from aimDir
+    -- Z - Up/down from aimDir
+    -- All values will be multiplied by a factor of 'hitboxHeight / 72' (72 is the standard hl2 player hitbox height)
+local offsetDefault = Vector( 4, 0, 2 ) -- Base positional offset for the camera. Will be overridden by the table entries below if applicable.
+local offsetsFromModel = { -- Automatially adds a camera offset if your model matches a specific path
+}
+local offsetsFromBodyGroup = { -- Automatially adds a camera offset if your model contains a particular bodygroup model (for use with url-based PACs, since model name becomes unreliable)
+    BodyGroupNames = {
+        ["Eouri The Avali"] = Vector( 5, 0, 2 ),
+    },
+    BodyGroupSubModels = {
+        ["Ligeia.smd"] = Vector( 2, 0, 3 ),
+    },
+}
+local offsetsFromBone = { -- Automatially adds a camera offset if your model contains a particular bone (for use with url-based PACs, since model name becomes unreliable)
+    ["wristwing02right"] = Vector( -0.8, -1, 2.8 ),
+}
+local offsetAdd = Vector( 0, 0, 0 ) -- Adds a view offset on top of the default/fromModel/fromBone
+local controlKey = KEY_RCONTROL
+local controlFontSize = 20
+local deactivateWhenULXRagdolled = true -- If you are ulx ragdolled, EFP will temporarily turn off to avoid breaking your camera.
+
+-- Anti-viewbob settings:
+-- Anticipate jankiness when holding tools, etc.
+local disableViewBobFirstPerson = false -- Disables the view bobbing effect when walking in first person. Will use the following values (and player scale) to position the eyes.
+local disableViewBobThirdPerson = true -- Same as above, but for third person.
+local eyeForward = 8
+local eyeOffsetX = 6
+local eyeOffsetY = 66
+local eyeOffsetYCrouched = 38
+local eyeOffsetYSitting = 28
+
+-- Third person settings:
+local thirdPersonZoom = 140 -- Will be multiplied against 'hitboxHeight / 72'
+local thirdPersonZoomRate = 10
+local thirdPersonZoomMin = -200
+local thirdPersonZoomMax = 1000
+local thirdPersonYaw = 0 -- Offset (in degrees) from the player's yaw.
+local thirdPersonYawRate = 20
+local thirdPersonYaw90Snap = 15 -- If the yaw offset is this close to a multiple of 90, it will snap to that multiple. Set to 0 to disable.
+local thirdPersonRight = 0 -- Offset (in hmu) in the right direction of the user's view.
+local thirdPersonRightRate = 1
+local thirdPersonUp = 0 -- Offset (in hmu) in the up direction of the user's view.
+local thirdPersonUpRate = 1
+local thirdPersonRightUpSnap = 5 -- If the right or up offset is this close to 0, it will snap to 0. Set to 0 to disable.
+local thirdPersonCollisionsEnabled = true -- Uses traces to prevent the camera from clipping through walls. Can be toggled during edit mode with right shift.
+local thirdPersonCollisionPush = 10 -- If the camera collides, nudge it forwards by this many units to avoid clipping at shallow angles.
+
+-- Usage:
+    -- In-game, tap controlKey to swtich between first person, third person, and off.
+    -- In third person, hold controlKey and use mouse wheel and left/right panning to change zoom and yaw offset.
+
+-- END CONFIG
+
+
+-- DEBUG:
+local holo
+local debugEnabled = false
+
+if debugEnabled and player() == owner() then
+    holo = hologram.create( Vector( 0, 0, 0 ), Angle( 0, 0, 0 ), "models/hunter/blocks/cube025x025x025.mdl", Vector( 1, 1, 1 ) * 0.1 )
+end
+--
+
+
+require( "lkl/cl_check_permissions.txt" )
+
+addPermissions( {
+    "render.hud",
+    "render.calcview"
+} )
+
+setupPermissionRequestSafe( permissions, "See yourself in first person", true )
+checkPermissions()
+
+local STATE_OFF = 0
+local STATE_FIRST_PERSON = 1
+local STATE_THIRD_PERSON = 2
+    local STATE_COUNT = 3
+
+local THIRD_PERSON_TRACE_COLLISION_GROUP = COLLISION_GROUP.PASSABLE_DOOR -- Don't collide with players
+local THIRD_PERSON_TRACE_MASK = MASK.VISIBLE_AND_NPCS
+
+local COLOR_PALE_RED = Color( 255, 125, 125, 255 )
+local COLOR_PALE_GREEN = Color( 125, 255, 125, 255 )
+
+local curState = STATE_FIRST_PERSON
+local viewBobDisabled = disableViewBobFirstPerson
+local plyEnt = player()
+local isEditing = false
+local boneID = plyEnt:lookupAttachment( "eyes" )
+local camPosOffsetX = 0
+local camPosOffsetY = 0
+local camPosOffsetZ = 0
+local scrW
+local scrH
+local ramLimit = ramMax() * 0.7
+local thirdPersonZoomStepDir = false
+local thirdPersonRightStepDir = false
+local thirdPersonUpStepDir = false
+local offsetsFromBoneList = table.getKeys( offsetsFromBone )
+local offsetsFromBoneCount = #offsetsFromBoneList
+local plyScale = plyEnt:obbSize().z / 72
+local plyModel
+local controlFont = render.createFont( "Roboto Mono", controlFontSize, 500, true, false, false, true, false, false )
+local controlTextColor = Color( 255, 255, 255, 255 )
+local plyRagdoll = nil
+
+local camTbl = {
+    drawviewer = true,
+}
+
+local mClamp = math.clamp
+local mAbs = math.abs
+local mSign = math.sign
+local mRound = math.round
+
+
+local function negativeMod( a, b )
+    local remainder = a % b
+    if a >= 0 or remainder == 0 then return remainder end
+
+    return remainder - b
+end
+
+local function calcOffset()
+    local model = plyEnt:getModel()
+
+    if plyModel == model then return end
+
+    local pos = offsetsFromModel[model] -- fromModel
+
+    if not pos then -- fromBodyGroup
+        local bodyGroups = plyEnt:getBodygroups()
+        local offsetsFromBodyGroupName = offsetsFromBodyGroup.BodyGroupNames
+        local offsetsFromBodyGroupSubModel = offsetsFromBodyGroup.BodyGroupSubModels
+
+        for _, bodyGroup in pairs( bodyGroups ) do
+            pos = offsetsFromBodyGroupName[bodyGroup.name]
+            if pos then break end
+
+            for _, subModel in pairs( bodyGroup.submodels ) do
+                pos = offsetsFromBodyGroupSubModel[subModel]
+                if pos then break end
+            end
+
+            if pos then break end
+        end
+    end
+
+    if not pos then -- fromBone
+        for i = 1, offsetsFromBoneCount do
+            local boneName = offsetsFromBoneList[i]
+
+            if plyEnt:lookupBone( boneName ) then
+                pos = offsetsFromBone[boneName]
+
+                break
+            end
+        end
+    end
+
+    pos = pos or offsetDefault
+    pos = ( pos + offsetAdd ) * plyScale
+
+    plyModel = model
+    camPosOffsetX = pos[1]
+    camPosOffsetY = pos[2]
+    camPosOffsetZ = pos[3]
+end
+calcOffset()
+
+local function thirdPersonCollisionCheck( camPosOriginal, camPosNew )
+    local tr = trace.line( camPosOriginal, camPosNew, plyEnt:getVehicle(), THIRD_PERSON_TRACE_MASK, THIRD_PERSON_TRACE_COLLISION_GROUP )
+
+    if tr.Hit then
+        if thirdPersonCollisionPush == 0 then return tr.HitPos end
+
+        return tr.HitPos + ( camPosOriginal - camPosNew ):getNormalized() * thirdPersonCollisionPush
+    end
+
+    return camPos
+end
+
+local function calcview()
+    if not permissionSatisfied then return end
+    if curState == STATE_OFF then return end
+    if plyRagdoll and deactivateWhenULXRagdolled then return end
+    if ramUsed() >= ramLimit then return end -- Avoid issues when lua memory gets too full
+
+    local camAng = plyEnt:getEyeAngles()
+    local chair = plyEnt:getVehicle()
+    chair = isValid( chair ) and chair
+
+    if chair then
+        camAng = chair:localToWorldAngles( camAng )
+    end
+
+    local aimDir = camAng:getForward()
+    local camPosOffsetEff = Vector( 0, 0, 0 )
+
+    if boneID ~= 0 and not viewBobDisabled then
+        camPos = plyEnt:getAttachment( boneID )
+    else
+        if chair then
+            camPos = plyEnt:getPos() + chair:getUp() * eyeOffsetYSitting * plyScale
+        else
+            local eyeOffsetYEff = plyEnt:isCrouching() and eyeOffsetYCrouched or eyeOffsetY
+            camPos = plyEnt:getPos() + Vector( 0, 0, eyeOffsetYEff * plyScale )
+        end
+
+        local forwardOffset = aimDir * eyeForward
+        local xOffset = aimDir * Vector( 1, 1, 0 ) * eyeOffsetX
+
+        camPos = camPos + ( forwardOffset + xOffset ) * plyScale
+    end
+
+    if camPosOffsetX ~= 0 then
+        camPosOffsetEff = camPosOffsetEff + aimDir * camPosOffsetX
+    end
+
+    if camPosOffsetY ~= 0 then
+        local aimRight = camAng:getRight()
+        camPosOffsetEff = camPosOffsetEff + aimRight * camPosOffsetY
+    end
+
+    if camPosOffsetZ ~= 0 then
+        local aimUp = camAng:getUp()
+        camPosOffsetEff = camPosOffsetEff + aimUp * camPosOffsetZ
+    end
+
+    if curState == STATE_THIRD_PERSON then
+        local camPosOriginal = camPos
+
+        camAng[2] = camAng[2] + thirdPersonYaw
+        aimDir = camAng:getForward()
+        camPos = camPos - aimDir * thirdPersonZoom * plyScale
+
+        if thirdPersonRight ~= 0 then
+            local aimRight = camAng:getRight()
+            camPosOffsetEff = camPosOffsetEff + aimRight * thirdPersonRight
+        end
+
+        if thirdPersonUp ~= 0 then
+            local aimUp = camAng:getUp()
+            camPosOffsetEff = camPosOffsetEff + aimUp * thirdPersonUp
+        end
+
+        if thirdPersonCollisionsEnabled then
+            camPos = thirdPersonCollisionCheck( camPosOriginal, camPos )
+        end
+    end
+
+    camPos = camPos + camPosOffsetEff
+
+    camTbl.origin = camPos
+    camTbl.angles = camAng
+
+    return camTbl
+end
+
+
+hook.add( "calcview", "LKL_EFP_Calcview", calcview )
+
+hook.add( "LKL_FancyInput_InputClk", "LKL_EFP_KeyClk", function( ply, key, state )
+    if ply ~= player() then return end
+
+    if key == controlKey then
+        if state then return end
+        if not isEditing then return end
+
+        isEditing = false
+        thirdPersonRight = mRound( thirdPersonRight )
+        thirdPersonUp = mRound( thirdPersonUp )
+
+        if thirdPersonRightUpSnap > 0 then
+            if mAbs( thirdPersonRight ) <= thirdPersonRightUpSnap then
+                thirdPersonRight = 0
+            end
+
+            if mAbs( thirdPersonUp ) <= thirdPersonRightUpSnap then
+                thirdPersonUp = 0
+            end
+        end
+
+        if thirdPersonYaw90Snap <= 0 then return end
+
+        local diff = negativeMod( thirdPersonYaw, 90 )
+
+        if mAbs( diff ) > thirdPersonYaw90Snap then
+            diff = 90 * mSign( thirdPersonYaw ) - diff
+            diff = -diff
+        end
+
+        if mAbs( diff ) <= thirdPersonYaw90Snap then
+            thirdPersonYaw = thirdPersonYaw - diff
+        end
+    elseif key == MOUSE_WHEEL_UP or key == MOUSE_WHEEL_DOWN then
+        if not state then
+            thirdPersonZoomStepDir = false
+
+            return
+        end
+
+        thirdPersonZoomStepDir = key == MOUSE_WHEEL_UP and -1 or 1
+    elseif key == KEY_RIGHT or key == KEY_LEFT then
+        local pressingRight = input.isKeyDown( KEY_RIGHT )
+        local pressingLeft = input.isKeyDown( KEY_LEFT )
+
+        if pressingRight and pressingLeft or ( not pressingRight and not pressingLeft ) then
+            thirdPersonRightStepDir = false
+
+            return
+        end
+
+        thirdPersonRightStepDir = pressingLeft and -1 or 1
+    elseif key == KEY_UP or key == KEY_DOWN then
+        local pressingUp = input.isKeyDown( KEY_UP )
+        local pressingDown = input.isKeyDown( KEY_DOWN )
+
+        if pressingUp and pressingDown or ( not pressingUp and not pressingDown ) then
+            thirdPersonUpStepDir = false
+
+            return
+        end
+
+        thirdPersonUpStepDir = pressingDown and -1 or 1
+    elseif key == KEY_RSHIFT then
+        if not state then return end
+        if not isEditing then return end
+
+        thirdPersonCollisionsEnabled = not thirdPersonCollisionsEnabled
+    end
+end )
+
+hook.add( "LKL_FancyInput_Tap", "LKL_EFP_Tap", function( ply, key, numTaps )
+    if ply ~= player() then return end
+
+    if key == controlKey then
+        curState = ( curState + numTaps ) % STATE_COUNT
+
+        if curState == STATE_FIRST_PERSON then
+            viewBobDisabled = disableViewBobFirstPerson
+        elseif curState == STATE_THIRD_PERSON then
+            viewBobDisabled = disableViewBobThirdPerson
+        end
+    end
+end )
+
+hook.add( "LKL_FancyInput_HoldStart", "LKL_EFP_HoldStart", function( ply, key )
+    if ply ~= player() then return end
+
+    if key == controlKey then
+        isEditing = true
+    end
+end )
+
+hook.add( "mousemoved", "LKL_EFP_ChangeThirdPersonYaw", function( x, _ )
+    if not isEditing then return end
+    if curState ~= STATE_THIRD_PERSON then return end
+    if not scrW then return end
+
+    x = x / scrW
+    --y = y / scrH
+
+    thirdPersonYaw = thirdPersonYaw - x * thirdPersonYawRate
+end )
+
+hook.add( "think", "LKL_EFP_ThirdPersonZoom", function()
+    if not isEditing then return end
+    if curState ~= STATE_THIRD_PERSON or not thirdPersonZoomStepDir then return end
+
+    thirdPersonZoom = mClamp( thirdPersonZoom + thirdPersonZoomStepDir * thirdPersonZoomRate, thirdPersonZoomMin, thirdPersonZoomMax )
+end )
+
+hook.add( "think", "LKL_EFP_ThirdPersonRight", function()
+    if not isEditing then return end
+    if curState ~= STATE_THIRD_PERSON or not thirdPersonRightStepDir then return end
+
+    thirdPersonRight = thirdPersonRight + thirdPersonRightStepDir * thirdPersonRightRate
+end )
+
+hook.add( "think", "LKL_EFP_ThirdPersonUp", function()
+    if not isEditing then return end
+    if curState ~= STATE_THIRD_PERSON or not thirdPersonUpStepDir then return end
+
+    thirdPersonUp = thirdPersonUp + thirdPersonUpStepDir * thirdPersonUpRate
+end )
+
+hook.add( "drawhud", "LKL_EFP_DrawHUD", function()
+    if not permissionSatisfied then return end
+
+    if not scrW then
+        scrW, scrH = render.getGameResolution()
+    end
+
+    if not isEditing then return end
+    if curState ~= STATE_THIRD_PERSON then return end
+
+    local controlTextOffsetY = 40
+
+    render.setFont( controlFont )
+    render.setColor( controlTextColor )
+
+    render.drawSimpleText( scrW * 0.5, scrH * 0.5 + controlTextOffsetY, "Zoom: " .. mRound( thirdPersonZoom, 1 ), 1, 3 )
+    render.drawSimpleText( scrW * 0.5, scrH * 0.5 + controlTextOffsetY + controlFontSize, "Yaw: " .. mRound( thirdPersonYaw, 1 ), 1, 3 )
+    render.drawSimpleText( scrW * 0.5, scrH * 0.5 + controlTextOffsetY + controlFontSize * 2, "Right: " .. mRound( thirdPersonRight ), 1, 3 )
+    render.drawSimpleText( scrW * 0.5, scrH * 0.5 + controlTextOffsetY + controlFontSize * 3, "Up: " .. mRound( thirdPersonUp ), 1, 3 )
+
+    if thirdPersonCollisionsEnabled then
+        render.setColor( COLOR_PALE_GREEN )
+        render.drawSimpleText( scrW * 0.5, scrH * 0.5 + controlTextOffsetY + controlFontSize * 4, "Collisions: Enabled", 1, 3 )
+    else
+        render.setColor( COLOR_PALE_RED )
+        render.drawSimpleText( scrW * 0.5, scrH * 0.5 + controlTextOffsetY + controlFontSize * 4, "Collisions: Disabled", 1, 3 )
+    end
+end )
+
+
+if deactivateWhenULXRagdolled then
+    hook.add( "OnEntityCreated", "DetectULXRagdoll", function( ent )
+        if not isValid( ent ) then return end
+        if ent:getClass() ~= "prop_ragdoll" then return end
+
+        timer.simple( 0.1, function()
+            if not isValid( ent ) then return end
+            if isValid( ent:getOwner() ) then return end
+            if player():getParent() ~= ent then return end
+            --if ent:getModel() ~= player():getModel() then return end
+
+            plyRagdoll = ent
+        end )
+    end )
+
+    hook.add( "EntityRemoved", "DetectULXRagdollDeletion", function( ent )
+        if ent == plyRagdoll then
+            plyRagdoll = nil
+        end
+    end )
+end
+
+
+
+timer.create( "LKL_EFP_GetBoneID", 1, 0, function()
+    --plyScale = plyEnt:obbSize().z / 72
+    boneID = plyEnt:lookupAttachment( "eyes" )
+
+    if plyEnt:isCrouching() then
+        plyScale = plyEnt:obbSize().z / 36
+    else
+        plyScale = plyEnt:obbSize().z / 72
+    end
+
+    if id == 0 then
+        id = plyEnt:lookupAttachment( "head" )
+    end
+end )
+
+timer.create( "LKL_EFP_CalcOffset", 5, 0, calcOffset )
+
+if debugEnabled and holo then
+    timer.create( "LKL_EFP_SeeCamPos", 0.1, 0, function()
+        local result = calcview()
+
+        holo:setPos( result and result.origin or Vector() )
+    end )
+end

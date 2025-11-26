@@ -1,0 +1,672 @@
+--@name Camo Holo
+--@author legokidlogan
+--@shared
+--@include lkl/syncable.txt
+--@include lkl/math/vector_math.txt
+
+if CamoHolo then return end
+if SERVER then render = render or {} end
+
+require( "lkl/syncable.txt" )
+require( "lkl/math/vector_math.txt" )
+
+
+--[[
+    - Applies a rough dynamic camo to holograms.
+    - Requires a HUD to work, will show up as the predator texture otherwise.
+--]]
+
+
+CamoHolo = class( "CamoHolo", Syncable )
+
+-- These apply to all instances and subclasses
+CamoHolo.static.SCREEN_RESOLUTION_SCALE = 1 / 4 -- 0-1 fraction, with higher values being more presice.
+CamoHolo.static.BLOB_ENABLED = false -- Draw using blobs instead of the screenspace texture. More cpu usage and slower updates to movement, but gives a more stylized look.
+CamoHolo.static.BLOB_COUNT = 50
+CamoHolo.static.BLOB_INTERVAL = 0 -- 0 To update every render frame
+CamoHolo.static.BLOB_SIZE = 6 * 200
+CamoHolo.static.BLOB_AREA_MULT = 1.25
+CamoHolo.static.BLOB_SCALE_WITH_HOLO = true
+CamoHolo.static.BLOB_HOLO_COMPARE_SIZE = Vector( 48 ):getLength()
+CamoHolo.static.PERF_LIMIT = 0.75
+
+CamoHolo.REPLICATION_DELAY = 1
+CamoHolo.INIT_SYNC_DELAY = 0.5
+
+
+local COLOR_EMPTY = Color( 0, 0, 0, 0 )
+local COLOR_NEAR_OPAQUE = Color( 255, 255, 255, 254 )
+--local COLOR_WHITE = Color( 255, 255, 255, 255 )
+
+--local RENDERMODE_WORLDGLOW = RENDERMODE.WORLDGLOW
+
+local allCamoHolos = {}
+local nextBlobTime = 0
+local rtNameMain = "LKL_CamoHolo_Main"
+local screenMat = nil
+local resetStencil
+
+local cpuAverage = cpuAverage
+local renderSetColor = render.setColor
+local renderDrawRectFast = render.drawRectFast
+local renderTraceSurfaceColor = render.traceSurfaceColor
+local mathMax = math.max
+local vectorMathRandomInsideBox = vectorMath.randomInsideBox
+
+
+----- STATIC FUNCTIONS -----
+
+function CamoHolo:initialize( replicateOnClient, pos, ang, model, scale, ... )
+    model = model or "models/hunter/blocks/cube1x1x1.mdl"
+    scale = scale or Vector( 1, 1, 1 )
+
+    CamoHolo.super.initialize( self, replicateOnClient, pos, ang, model, scale, ... )
+
+    local holo = hologram.create( pos, ang, model, scale )
+    if not isValid( holo ) then error( "Failed to intialize " .. self.class.name ) end
+
+    self._holo = holo
+    holo._camoHolo_Object = self
+    holo:suppressEngineLighting( true )
+
+    table.insert( allCamoHolos, self )
+
+    if SERVER then
+        holo:setColor( COLOR_EMPTY )
+        holo:doNotDuplicate()
+
+        self:syncProperty( "CamoHolo_ReferenceHolo", holo )
+    else
+        if render.isHUDActive() then
+            holo:setNoDraw( true )
+            holo:setMaterial( "tools/toolsblack_cheap" )
+
+            if CamoHolo.BLOB_ENABLED then
+                holo:setMaterial( "tools/toolsblack_cheap" )
+            else
+                holo:setMaterial( "black_outline" )
+            end
+        else
+            holo:setMaterial( "models/shadertest/predator" )
+        end
+
+        holo:setColor( COLOR_NEAR_OPAQUE )
+        --holo:setRenderMode( RENDERMODE_WORLDGLOW )
+    end
+end
+
+
+----- INSTANCE FUNCTIONS -----
+
+function CamoHolo:getHolo()
+    return self._holo
+end
+
+-- On server, always nil. On client, returns the serverside reference holo or nil if the CamoHolo is not a synced client copy.
+function CamoHolo:getReferenceHolo()
+    return self._referenceHolo
+end
+
+-- Sets the position of the CamoHolo. Does nothing on a synced client copy.
+function CamoHolo:setPos( pos )
+    if self:getReferenceHolo() ~= nil then return end
+    if type( pos ) ~= "Vector" then error( "Expected pos to be a Vector" ) end
+
+    self:getHolo():setPos( pos )
+end
+
+function CamoHolo:getPos()
+    return self:getHolo():getPos()
+end
+
+-- Sets the Angles of the CamoHolo. Does nothing on a synced client copy.
+function CamoHolo:setAngles( ang )
+    if self:getReferenceHolo() ~= nil then return end
+    if type( ang ) ~= "Angle" then error( "Expected ang to be an Angle" ) end
+
+    self:getHolo():setAngles( ang )
+end
+
+function CamoHolo:getAngles()
+    return self:getHolo():getAngles()
+end
+
+function CamoHolo:getForward()
+    return self:getHolo():getForward()
+end
+
+function CamoHolo:getRight()
+    return self:getHolo():getRight()
+end
+
+function CamoHolo:getUp()
+    return self:getHolo():getUp()
+end
+
+-- Sets the parent of the CamoHolo. Does nothing on a synced client copy.
+function CamoHolo:setParent( parent )
+    if self:getReferenceHolo() ~= nil then return end
+    if parent ~= nil and not parent:isValid() then error( "Expected parent to be valid or nil" ) end
+
+    self:getHolo():setParent( parent )
+end
+
+function CamoHolo:getParent()
+    local holoEff = self:getReferenceHolo() or self:getHolo()
+
+    return holoEff:getParent()
+end
+
+function CamoHolo:setModel( model )
+    if type( model ) ~= "string" then error( "Expected model to be a string" ) end
+
+    self:getHolo():setModel( model )
+    self:syncProperty( "CamoHolo_Model", model )
+end
+
+function CamoHolo:getModel()
+    return self:getHolo():getModel()
+end
+
+function CamoHolo:setScale( scale )
+    if type( scale ) ~= "Vector" then error( "Expected scale to be a Vector" ) end
+
+    self:getHolo():setScale( scale )
+    self:syncProperty( "CamoHolo_Scale", scale )
+end
+
+function CamoHolo:getScale()
+    return self:getHolo():getScale()
+end
+
+function CamoHolo:setSize( size )
+    if type( size ) ~= "Vector" then error( "Expected size to be a Vector" ) end
+
+    self:getHolo():setSize( size )
+    self:syncProperty( "CamoHolo_Size", size )
+end
+
+function CamoHolo:getSize()
+    local holo = self:getHolo()
+
+    return holo:obbSize() * holo:getScale()
+end
+
+function CamoHolo:setClip( index, enabled, origin, normal, entity )
+    self:getHolo():setClip( index, enabled, origin, normal, entity )
+
+    if SERVER then
+        self:syncProperty( "CamoHolo_Clip", {
+            index = index,
+            enabled = enabled,
+            origin = origin,
+            normal = normal,
+            entity = entity,
+        } )
+    end
+end
+
+function CamoHolo:getClipping()
+    return self:getHolo():getClipping()
+end
+
+function CamoHolo:emitSound( ... )
+    self:getHolo():emitSound( ... )
+end
+
+function CamoHolo:stopSound( ... )
+    self:getHolo():stopSound( ... )
+end
+
+function CamoHolo:getClass()
+    return self:getHolo():getClass()
+end
+
+function CamoHolo:getOwner()
+    return self:getHolo():getOwner()
+end
+
+function CamoHolo:remove()
+    self:destroy()
+end
+
+function CamoHolo:obbSize()
+    return self:getHolo():obbSize()
+end
+
+function CamoHolo:obbCenter()
+    return self:getHolo():obbCenter()
+end
+
+function CamoHolo:obbCenterW()
+    return self:getHolo():obbCenterW()
+end
+
+function CamoHolo:obbMins()
+    return self:getHolo():obbMins()
+end
+
+function CamoHolo:obbMaxs()
+    return self:getHolo():obbMaxs()
+end
+
+function CamoHolo:worldSpaceAABB()
+    return self:getHolo():worldSpaceAABB()
+end
+
+function CamoHolo:localToWorld( pos )
+    return self:getHolo():localToWorld( pos )
+end
+
+function CamoHolo:worldToLocal( pos )
+    return self:getHolo():worldToLocal( pos )
+end
+
+function CamoHolo:localToWorldAngles( ang )
+    return self:getHolo():localToWorldAngles( ang )
+end
+
+function CamoHolo:worldToLocalAngles( ang )
+    return self:getHolo():worldToLocalAngles( ang )
+end
+
+function CamoHolo:localToWorldVector( vec )
+    return self:getHolo():localToWorldVector( vec )
+end
+
+function CamoHolo:worldToLocalVector( vec )
+    return self:getHolo():worldToLocalVector( vec )
+end
+
+-- Does nothing. Here only to prevent errors if you replace a hologram with a CamoHolo.
+function CamoHolo:setMaterial()
+    -- Do nothing
+end
+
+function CamoHolo:getMaterial()
+    return self:getHolo():getMaterial()
+end
+
+-- Does nothing. Here only to prevent errors if you replace a hologram with a CamoHolo.
+function CamoHolo:setColor()
+    -- Do nothing
+end
+
+function CamoHolo:getColor()
+    return self:getHolo():getColor()
+end
+
+-- Does nothing. Here only to prevent errors if you replace a hologram with a CamoHolo.
+function CamoHolo:setSkin()
+    -- Do nothing
+end
+
+function CamoHolo:getSkin()
+    return self:getHolo():getSkin()
+end
+
+function CamoHolo:getSkinCount()
+    return self:getHolo():getSkinCount()
+end
+
+-- Does nothing. Here only to prevent errors if you replace a hologram with a CamoHolo.
+function CamoHolo:setRenderMode()
+    -- Do nothing
+end
+
+function CamoHolo:getRenderMode()
+    return self:getHolo():getRenderMode()
+end
+
+-- Does nothing. Here only to prevent errors if you replace a hologram with a CamoHolo.
+function CamoHolo:setRenderFX()
+    -- Do nothing
+end
+
+function CamoHolo:getRenderFX()
+    return self:getHolo():getRenderFX()
+end
+
+-- Does nothing. Here only to prevent errors if you replace a hologram with a CamoHolo.
+function CamoHolo:suppressEngineLighting()
+    -- Do nothing
+end
+
+function CamoHolo:getSuppressEngineLighting()
+    return self:getHolo():getSuppressEngineLighting()
+end
+
+
+if SERVER then
+    function CamoHolo:doNotDuplicate()
+        self:getHolo():doNotDuplicate()
+    end
+else
+    function CamoHolo:setRenderMatrix( matrix )
+        self:getHolo():setRenderMatrix( matrix )
+    end
+end
+
+
+
+----- OVERRIDABLE FUNCTIONS -----
+
+
+
+----- IMPLEMENTED FUNCTIONS -----
+
+function CamoHolo:onDestroyed()
+    local holo = self:getHolo()
+    if isValid( holo ) then
+        holo._camoHolo_Object = nil
+        holo:remove()
+    end
+
+    table.removeByValue( allCamoHolos, self )
+
+    CamoHolo.super.onDestroyed( self )
+end
+
+
+----- PRIVATE FUNCTIONS -----
+
+resetStencil = function()
+    render.setStencilWriteMask( 0xFF )
+    render.setStencilTestMask( 0xFF )
+    render.setStencilReferenceValue( 0 )
+    render.setStencilCompareFunction( STENCIL.ALWAYS )
+    render.setStencilPassOperation( STENCIL.KEEP )
+    render.setStencilFailOperation( STENCIL.KEEP )
+    render.setStencilZFailOperation( STENCIL.KEEP )
+    render.clearStencil()
+end
+
+
+----- SETUP -----
+
+hook.add( "EntityRemoved", "LKL_CamoHolo_TrackDestryoedHolos", function( ent )
+    if not ent then return end
+
+    local camoHolo = ent._camoHolo_Object
+    if not isValid( camoHolo ) then return end
+
+    if camoHolo:isSyncedCopy() then
+        if not ent._camoHolo_IsReferenceHolo then error( tostring( camoHolo ) .. " had its holo destroyed manually, which is not allowed!" ) end
+
+        camoHolo._referenceHolo = nil
+        camoHolo:getHolo():setParent()
+
+        return
+    end
+
+    camoHolo._holo = nil
+    camoHolo:destroy()
+end )
+
+
+if SERVER then
+    function CamoHolo:writeCreationData( pos, ang, model, scale )
+        net.writeVector( pos )
+        net.writeAngle( ang )
+        net.writeString( model )
+        net.writeVector( scale )
+    end
+
+    return
+end
+
+
+function CamoHolo.static:readCreationData()
+    return {
+        net.readVector(),
+        net.readAngle(),
+        net.readString(),
+        net.readVector(),
+    }
+end
+
+
+hook.add( "renderoffscreen", "LKL_CamoHolo_InitClearScreen", function()
+    render.selectRenderTarget( rtNameMain )
+    render.clear( COLOR_EMPTY )
+    render.selectRenderTarget()
+
+    hook.remove( "renderoffscreen", "LKL_CamoHolo_InitClearScreen" )
+end )
+
+--hook.add( "drawhud", "LKL_CamoHolo_DrawBlobs", function()
+hook.add( "renderoffscreen", "LKL_CamoHolo_DrawBlobs", function()
+    if not CamoHolo.BLOB_ENABLED then return end
+    if not render.isHUDActive() then return end
+
+    local blobInterval = CamoHolo.BLOB_INTERVAL
+
+    if blobInterval ~= 0 then
+        local now = timer.curtime()
+        if now < nextBlobTime then return end
+
+        nextBlobTime = now + blobInterval
+    end
+
+    local blobCount = CamoHolo.BLOB_COUNT
+    local blobSize = CamoHolo.BLOB_SIZE
+    local blobAreaMult = CamoHolo.BLOB_AREA_MULT
+    local blobScaleWithHolo = CamoHolo.BLOB_SCALE_WITH_HOLO
+    local blobHoloCompareSize = CamoHolo.BLOB_HOLO_COMPARE_SIZE
+    local perfLimit = CamoHolo.PERF_LIMIT * cpuMax()
+
+    local scrW, scrH = render.getGameResolution()
+    local eyePos = render.getEyePos()
+
+    local xMult = 1024 / scrW
+    local yMult = 1024 / scrH
+
+    render.selectRenderTarget( rtNameMain )
+
+    for _, camoHolo in ipairs( allCamoHolos ) do
+        if cpuAverage() >= perfLimit then return end
+
+        local holo = camoHolo:getHolo()
+        local holoPos = holo:getPos()
+
+        if not holoPos:toScreen().visible then continue end
+
+        local aabbMin, aabbMax = holo:worldSpaceAABB()
+        local holoScale = holo:getScale()
+        local holoScaleWithAreaMult = holoScale * blobAreaMult
+
+        aabbMin = holoPos + ( aabbMin - holoPos ) * holoScaleWithAreaMult
+        aabbMax = holoPos + ( aabbMax - holoPos ) * holoScaleWithAreaMult
+
+        local dist = holoPos:getDistance( eyePos )
+        local distMult = 1 / dist
+
+        if blobScaleWithHolo then
+            local holoSize = holo:obbSize() * holoScale
+
+            distMult = distMult * holoSize:getLength() / blobHoloCompareSize
+        end
+
+        local blobSizeEff = mathMax( blobSize * distMult, 2 )
+        local blobRadiusEff = blobSizeEff * 0.5
+
+        for _ = 1, blobCount do
+            local blobPos = vectorMathRandomInsideBox( aabbMin, aabbMax )
+            local blobScrPos = blobPos:toScreen()
+
+            if blobScrPos.visible then
+                local blobX = blobScrPos.x - blobRadiusEff
+                local blobY = blobScrPos.y - blobRadiusEff
+                local color = renderTraceSurfaceColor( eyePos, blobPos + ( blobPos - eyePos ) * 100 )
+
+                renderSetColor( color )
+                renderDrawRectFast( blobX * xMult, blobY * yMult, blobSizeEff * xMult, blobSizeEff * yMult )
+            end
+        end
+    end
+
+    render.selectRenderTarget()
+end )
+
+--hook.add( "PostDrawOpaqueRenderables", "LKL_CamoHolo_DrawHolos", function( _, skybox, skybox3D )
+hook.add( "PreDrawTranslucentRenderables", "LKL_CamoHolo_DrawHolos", function( _, skybox, skybox3D )
+    if skybox or skybox3D then return end
+
+    local scrW, scrH = render.getGameResolution()
+
+    local blobEnabled = CamoHolo.BLOB_ENABLED
+    local screenResScale = CamoHolo.SCREEN_RESOLUTION_SCALE
+    local useScaledScreen = not blobEnabled and screenResScale < 1
+
+    if useScaledScreen then
+        render.pushViewMatrix( { type = "2D" } )
+        render.selectRenderTarget( rtNameMain )
+
+        render.setMaterial( screenMat )
+        render.drawTexturedRectUV( 0, 0, 1024 * screenResScale, 1024 * screenResScale, 0, 0, 1, 1 )
+
+        render.selectRenderTarget()
+        render.popViewMatrix()
+    end
+
+    resetStencil()
+    render.setStencilEnable( true )
+    render.setStencilReferenceValue( 1 )
+    render.setStencilCompareFunction( STENCIL.NOTEQUAL )
+    render.setStencilPassOperation( STENCIL.REPLACE )
+
+    for _, camoHolo in ipairs( allCamoHolos ) do
+        camoHolo:getHolo():draw()
+    end
+
+    render.setStencilCompareFunction( STENCIL.EQUAL )
+    render.setStencilPassOperation( STENCIL.KEEP )
+
+
+    render.pushViewMatrix( { type = "2D" } )
+
+    if blobEnabled then
+        render.setMaterial( rtMatMain )
+        render.drawTexturedRectUV( 0, 0, scrW, scrH, 0, 0, 1, 1 )
+    else
+        render.setColor( COLOR_NEAR_OPAQUE )
+
+        if useScaledScreen then
+            render.setMaterial( rtMatMain )
+            render.drawTexturedRectUV( 0, 0, scrW, scrH, 0, 0, screenResScale, screenResScale )
+        else
+            render.setMaterial( screenMat )
+            render.drawTexturedRectUV( 0, 0, scrW, scrH, 0, 0, 1, 1 )
+        end
+    end
+
+    render.popViewMatrix()
+
+
+    render.setStencilEnable( false )
+end )
+
+local function hudChanged( state )
+    for _, camoHolo in ipairs( allCamoHolos ) do
+        local holo = camoHolo:getHolo()
+
+        if state then
+            holo:setNoDraw( true )
+
+            if CamoHolo.BLOB_ENABLED then
+                holo:setMaterial( "tools/toolsblack_cheap" )
+            else
+                holo:setMaterial( "black_outline" )
+            end
+        else
+            holo:setNoDraw( false )
+            holo:setMaterial( "models/shadertest/predator" )
+        end
+    end
+end
+
+hook.add( "hudconnected", "LKL_CamoHolo_HudChanged", function()
+    hudChanged( true )
+end )
+
+hook.add( "huddisconnected", "LKL_CamoHolo_HudChanged", function()
+    hudChanged( false )
+end )
+
+
+net.receive( "LKL_Syncable_Set__CamoHolo_ReferenceHolo", function()
+    local camoHolo = Syncable:readSyncedCopy()
+    local refHolo = net.readEntity():toHologram()
+
+    if not camoHolo then return end
+
+    camoHolo._referenceHolo = refHolo
+
+    refHolo._camoHolo_Object = camoHolo
+    refHolo._camoHolo_IsReferenceHolo = true
+
+    local holo = camoHolo:getHolo()
+
+    holo:setParent()
+    holo:setModel( refHolo:getModel() )
+    holo:setScale( refHolo:getScale() )
+    holo:setPos( refHolo:getPos() )
+    holo:setAngles( refHolo:getAngles() )
+    holo:setParent( refHolo )
+end )
+
+net.receive( "LKL_Syncable_Set__CamoHolo_Model", function()
+    local camoHolo = Syncable:readSyncedCopy()
+    local model = net.readString()
+
+    if not camoHolo then return end
+
+    camoHolo:setModel( model )
+end )
+
+net.receive( "LKL_Syncable_Set__CamoHolo_Scale", function()
+    local camoHolo = Syncable:readSyncedCopy()
+    local scale = net.readVector()
+
+    if not camoHolo then return end
+
+    camoHolo:setScale( scale )
+end )
+
+net.receive( "LKL_Syncable_Set__CamoHolo_Size", function()
+    local camoHolo = Syncable:readSyncedCopy()
+    local size = net.readVector()
+
+    if not camoHolo then return end
+
+    camoHolo:setSize( size )
+end )
+
+net.receive( "LKL_Syncable_Set__CamoHolo_Clip", function()
+    local camoHolo = Syncable:readSyncedCopy()
+    local clipData = net.readTable()
+
+    if not camoHolo then return end
+
+    local ent = clipData.entity
+
+    if ent and ent.toHologram then
+        pcall( function()
+            ent = ent:toHologram()
+        end )
+    end
+
+    camoHolo:setClip( clipData.index, clipData.enabled, clipData.origin, clipData.normal, ent )
+end )
+
+
+do
+    render.createRenderTarget( rtNameMain )
+
+    rtMatMain = material.create( "UnlitGeneric" )
+    rtMatMainName = "!" .. rtMatMain:getName()
+    rtMatMain:setTextureRenderTarget( "$basetexture", rtNameMain )
+
+    screenMat = material.create( "UnlitGeneric" )
+    screenMat:setTexture( "$basetexture", "_rt_PowerOfTwoFB" )
+end

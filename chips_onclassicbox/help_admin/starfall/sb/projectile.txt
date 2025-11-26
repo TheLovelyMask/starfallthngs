@@ -1,0 +1,682 @@
+--@name Projectile
+--@author shroobloom
+--@server
+--@include sb/util.txt
+--@include sb/spawner.txt
+--@include sb/precacher.txt
+
+
+
+local Util = require("sb/util.txt")
+local Spawner = require("sb/spawner.txt")
+local Precacher = require("sb/precacher.txt")
+
+
+local Projectile = class("Projectile")
+Projectile.Instances = {}
+Projectile.ExplosivePrecacher = Precacher:getOrCreate( "models/props_phx/ww2bomb.mdl", 0 ) --Change this object's "Size" variable to precache explosives
+
+
+
+--TODO:
+-- [ ] Missiles should lose their target if they die, also, they'd try to go back to their LaunchAngle, which is bad.
+-- [X] Arc mode, they should do a big arc to reach their target if this is on
+-- [X] A ThrustMax and ThrustRampupTime variable to allow the rockets to move faster the longer they're alive for
+-- [X] Projectiles should have a Lifetime property, and explode (or lose fuel?) after they live for long enough
+-- [X] Projectiles should allow for multiple explosives to detonate
+-- [ ] Sometimes guidance screws up and causes the missile to loop around. this is not a quirk of wobble, its likely only when its going straight down and has to change yaw
+-- [~] Fix delta silo to not be explosion ratelimited
+-- [ ] Particles (for rocket trails) (also ensure they have a clientmain or something?) (also make it possible to load existing particle systems?)
+
+
+
+Projectile.PropertyDefaults = {
+    -- The model to spawn (ensure you're able to spawn a prop before running Projectile::new if you're using this!)
+    Model = "models/props_phx/ww2bomb.mdl",
+    
+    -- Or supply an already-spawned entity to use instead:
+    Instance = nil,
+    
+    -- The forward vector of the model
+    -- Barrels, for example, you might want the "up" vector to face forward, so you'll use (0,0,1)
+    ModelForward = Vector(1,0,0),
+    
+    -- No longer used
+    --ModelAngle = Angle(90,0,0),
+    
+    -- Whether or not to :fire() the projectile as it's spawned
+    Enabled = true,
+    
+    -- Initial velocity - the projectile will have this velocity on launch
+    -- The max speed for a projectile is equal to physenv.getPerformanceSettings().MaxVelocity, which is ~2966 at the time of writing on CFC.
+    Speed = 0,
+    
+    -- The amount to randomly spread shots on fire
+    -- In degrees
+    Spread = 0,
+    
+    -- Constant thrust - the projectile will try to maintain this speed
+    Thrust = 0,
+    
+    -- Maximum thrust and thrust rampup - the projectile will slowly ramp up to this thrust level as it's existed for up to its rampup time
+    -- Similar to how the LFS Rocket Launcher will speed up as it's been chasing the target for longer. Good for versatile weapons.
+    ThrustMax = nil,
+    ThrustRampupTime = 10,
+    
+    Gravity = true,
+    
+    -- Projectile will explode and play ExplosionEffect on collide if this is true
+    Explosive = true,
+    
+    -- Explosion effect
+    ExplosionEffect = {
+        Name = "glide_explosion",
+        Scale = 1,
+        Radius = 1,
+        Magnitude = 1
+    },
+    
+    -- Override to change behaviour
+    playExplosionEffect = function( self )
+        local ef = effect.create()
+        ef:setOrigin( self.Instance:getPos() )
+        ef:setScale( self.ExplosionEffect.Scale )
+        ef:setRadius( self.ExplosionEffect.Radius )
+        ef:setMagnitude( self.ExplosionEffect.Magnitude )
+        ef:play( self.ExplosionEffect.Name )
+    end,
+    
+    Trail = {
+        Material = "", --trails/smoke
+        StartSize = 10,
+        EndSize = 75,
+        Length = 0.25, --Duration
+        Color = Color(255,255,255),
+        Additive = false
+    },
+    
+    -- Causes the projectile to spiral as it flies through the air. (TODO: rename?)
+    Wobble = {
+        Speed = 0,
+        Power = 0
+    },
+    
+    -- Homing properties
+    Guidance = {
+        -- The max turn rate in degrees/s
+        TurnRate = 45,
+        
+        -- The clamping cone (in degrees) to use for determining force
+        -- Increase it if your rocket is spazzing out. Decrease it if your rocket isn't snappy enough.
+        ClampCone = 5,
+        
+        -- If set, causes the missiles to curve to their target instead of flying directly at them at a specific height.
+        ArcHeight = 0
+    },
+    
+    -- If true, the projectile will turn to face its current velocity
+    -- Has no effect on homing projectiles.
+    FinStabilized = true,
+    
+    -- After this duration, the projectile will self-remove
+    Lifetime = 30,
+    
+    -- The number of supplementary explosives to spawn
+    -- NOTE: Allow some time after creating the projectile for these explosives to be created
+    -- You may check if all supplementary explosives are spawned by reading "Ready"
+    ExplosionPower = 0,
+    
+    -- How long it takes for the projectile to fade out after it hits (only for non-explosive projectiles)
+    FadeOutTime = 5,
+    
+    -- Override to run this code when the projectile fully fades out (only for non-explosive projectiles)
+    removeCallback = nil,
+    
+    -- The number of times this projectile can bounce
+    MaxBounces = 0,
+    
+    -- The max angle this projectile can bounce from, 0-90, 0 = perpendicular (never bounce), 90 = parallel (always bounce)
+    MaxBounceAngle = 90,
+    
+    -- Override to determine whether or not the projectile should bounce
+    shouldBounce = function( self, hit )
+        if self.BouncesLeft == 0 then return false end
+        
+        local dir = hit.OurOldVelocity:getNormalized()
+        local surface = hit.HitNormal
+        
+        local angle = 90 - math.deg(math.acos( surface:dot(dir) ))
+        
+        return angle < self.MaxBounceAngle
+    end,
+    
+    -- Override to replace the default bounce and impact behaviour.
+    onCollide = function( self, hit )
+        if self:shouldBounce( hit ) then
+            self.BouncesLeft = self.BouncesLeft - 1
+            
+            local curVel = hit.OurOldVelocity --self.Instance:getVelocity()
+            local reflected = curVel - 2 * (curVel:dot(hit.HitNormal)) * hit.HitNormal
+            local _, newAngle = localToWorld( Vector(), -self.ModelAngle, Vector(), reflected:getAngle() )
+            
+            self.Instance:setAngles( newAngle ) --reflected:getAngle() - self.ModelAngle
+            self.Instance:getPhysicsObject():setVelocity( reflected  )
+            self.Instance:setAngleVelocity( Vector() )
+            
+            return
+        end
+        
+        --if true then return end
+        self:onHit( hit )
+    end,
+    
+    -- Runs 10 times/s (after every Projectile:think event)
+    onThink = function()
+        
+    end,
+    
+    onHit = function( self, hit )
+        self.Hit = true
+        
+        if self.Explosive then
+            self:detonate( nil, hit )
+        else
+            self:remove()
+            --TODO: also clear properties?
+        end
+    end,
+    
+    -- Runs when the explosive is detonated
+    onDetonate = function( self, hitOptional )
+        
+    end
+}
+
+
+
+function Projectile:initialize( pos, ang, properties )
+    
+    Util.applyDefaults( properties, Projectile.PropertyDefaults )
+    
+    for i,v in pairs(properties) do
+        self[i] = v
+    end
+    
+    self.ModelAngle = self.ModelForward:getAngle()
+    
+    -- i think it's negative because it's "undoing" that vector?
+    local _, effectiveAng = localToWorld( Vector(), -self.ModelAngle, Vector(), ang )
+    
+    if not self.Instance then
+        self.Instance = prop.create( pos, effectiveAng, properties.Model, false )
+    else
+        self.Instance:setPos( pos )
+        self.Instance:setAngles( effectiveAng )
+        self.Instance:setFrozen( false )
+    end
+    
+    self.Instance:enableDrag( false )
+    self.Instance:enableGravity( properties.Gravity )
+    self.Instance:doNotDuplicate()
+    
+    if self.Explosive then 
+        --self.Instance:setMass(1) --just so impacts dont kill
+        self.Instance:getPhysicsObject():addGameFlags( FVPHYSICS.NO_IMPACT_DMG + FVPHYSICS.NO_NPC_IMPACT_DMG ) --allegedly works better
+    end
+    
+    if self.MaxBounces > 0 then
+        self.Instance:setPhysMaterial("gmod_bouncy") --to prevent energy loss on bounce
+    end
+    
+    self.Instance:setCollisionGroup(COLLISION_GROUP.INTERACTIVE_DEBRIS)
+    
+    self.Instance.Projectile = self
+    
+    self.Detonated = false
+    self.Target = nil --Either a Vector or an Entity
+    
+    --TODO: configuration
+    self.WobbleSeed = math.random()*math.pi
+    self.WobbleDir = math.sign(math.random()-0.5)
+    self.Ready = not self.Explosive or self.ExplosionPower == 0
+    
+    self.BouncesLeft = properties.MaxBounces
+    
+    if properties.Enabled then
+        self.Enabled = false
+        self:fire()
+    end
+    
+    table.insert(Projectile.Instances, self)
+    
+    
+    self.SupplementaryExplosives = {}
+    
+    --TODO: support for non-explosive projectiles creating explosions on hit if absolutely needed
+    if self.Explosive and self.ExplosionPower > 0 then
+        Util.spawn(function()
+            Projectile.ExplosivePrecacher:takePropsAsync( self.ExplosionPower, function( ent )
+                if not self:isValid() then return true end
+                table.insert(self.SupplementaryExplosives, ent)
+                
+                ent:setCollisionGroup(COLLISION_GROUP.IN_VEHICLE)
+            end)
+            
+            self.Ready = true
+            
+            --print("precache async done, total props: ", #self.SupplementaryExplosives)
+            
+            if self.AwaitingSupplementaryThread then
+                coroutine.resume(self.AwaitingSupplementaryThread)
+            end
+        end)
+    end
+end
+
+
+function Projectile:awaitSupplementarySpawns()
+    if self.Ready then return end
+    
+    self.AwaitingSupplementaryThread = coroutine.running()
+    coroutine.yield()
+end
+
+
+
+function Projectile:fire()
+    assert(not self.Enabled, "Projectile has already been fired!")
+    
+    -- Correct position/velocity
+    if isValid(self:getParent()) then
+        local Parent = self:getParent()
+        local LocalPos = Parent:worldToLocal(self.Instance:getPos())
+        self:setParent( nil )
+        self.Instance:setPos(Parent:localToWorld(LocalPos))
+        
+        local Grandparent = Util.getGrandparent( Parent )
+        
+        timer.simple(0, function()
+            if not isValid(Grandparent) or not self:isValid() then return end
+            self.Instance:getPhysicsObject():addVelocity(Grandparent:getPhysicsObject():getVelocityAtPoint( self.Instance:getPos() ))
+        end)
+    end
+    
+    if self:isFrozen() then
+        self:setFrozen( false )
+    end
+    
+    self.LaunchTime = timer.curtime()
+    self.LaunchPos = self.Instance:getPos()
+    
+    local _, launchAngle = localToWorld(Vector(), -self.ModelAngle, Vector(), self.Instance:getAngles())
+    
+    self.LaunchAngle = launchAngle --self.Instance:getAngles() + self.ModelAngle
+    self.Enabled = true
+    
+    local dir = self:getForward()
+    
+    if self.Spread ~= 0 then
+        --dir = (dir:getAngle() + Angle(math.random()-0.5, math.random()-0.5, math.random()-0.5) * 2 * self.Spread):getForward()
+        local dirAng = dir:getAngle()
+        local off = Angle(math.random()-0.5, math.random()-0.5, math.random()-0.5) * 2 * self.Spread
+        local _, newAngle = localToWorld(Vector(), off, Vector(), dirAng)
+        
+        dir = newAngle:getForward()
+        local _, newLaunchAngle = localToWorld(Vector(), -self.ModelAngle, Vector(), newAngle)
+        self.Instance:setAngles( newLaunchAngle )
+    end
+    
+    self.Instance:applyForceCenter( dir * self.Speed * self.Instance:getMass() )
+    
+    if self.Trail.Material ~= "" then
+        self.Instance:setTrails(self.Trail.StartSize, self.Trail.EndSize, self.Trail.Length, self.Trail.Material, self.Trail.Color, nil, self.Trail.Additive)
+    end
+    
+    self.Instance:addCollisionListener(function( hit )
+        if timer.curtime() == self.LastHit or self.Hit or hit.HitEntity.Projectile then return end
+        self.LastHit = timer.curtime()
+        self:onCollide( hit )
+    end)
+end
+
+
+function Projectile:getTargetPos()
+    return type(self.Target) == "Vector" and self.Target or self.Target:obbCenterW()
+end
+
+
+function Projectile:setFrozen( state )
+    self.Instance:setFrozen( state )
+end
+
+function Projectile:isFrozen()
+    return self.Instance:isFrozen()
+end
+
+function Projectile:setParent( ent )
+    self.Instance:setParent( ent )
+end
+
+function Projectile:getParent()
+    return self.Instance:getParent()
+end
+
+
+
+function Projectile:getForward()
+    return self.Instance:localToWorldVector( self.ModelForward )
+end
+
+
+--@include sb/debug.txt
+local Debug = require("sb/debug.txt")
+
+
+-- Runs 10 times/s to allow for a ton of projectiles and still being performant
+-- TODO: dynamic rate?
+function Projectile:think( dt )
+    if not self.Enabled then return end
+    
+    if type(self.Target) ~= "Vector" and not isValid(self.Target) then
+        self.Target = nil
+    end
+    
+    if timer.curtime() - self.LaunchTime > self.Lifetime then
+        return self:detonate()
+    end
+    
+    if self.Thrust > 0 then
+        local curThrust = self.Thrust
+        
+        if self.ThrustMax then
+            local accel = math.clamp((timer.curtime() - self.LaunchTime) / self.ThrustRampupTime, 0, 1)
+            curThrust = math.lerp(accel, self.Thrust, self.ThrustMax or self.Thrust)
+        end
+        
+        self.Instance:applyForceCenter( (self:getForward()*curThrust - self.Instance:getVelocity()) * self.Instance:getMass() )
+    end
+    
+    
+    
+    local targetAngle = self.LaunchAngle
+    
+    if self.Target then
+        local targetPos = self:getTargetPos()
+        
+        --TODO: improve arc, its kind of janky and should probably interpolate the angle based off of launch angle (and impact angle, which is just opposite of launch angle?) rather than specifying a set height and using target position
+        if self.Guidance.ArcHeight > 0 then
+            local tpz0 = targetPos:clone():setZ(0)
+            local lpz0 = self.LaunchPos:clone():setZ(0)
+            
+            local startDist = tpz0:getDistance(lpz0)
+            local currentDist = tpz0:getDistance( self.Instance:getPos():setZ(0) )
+            local alpha = 1 - math.clamp(currentDist / startDist, 0, 1)
+            local mid = (self.LaunchPos + targetPos)/2
+            mid:setZ( math.max(self.LaunchPos.z, targetPos.z) + self.ArcHeight )
+            
+            targetPos = math.bezierVector( alpha + 0.1, self.LaunchPos, mid, targetPos )
+        end
+        
+        if self.Target.getVelocity then
+            local dist = targetPos:getDistance(self.Instance:getPos())
+            local ttr = math.min(dist / self.Instance:getVelocity():getLength() - 0.1, 3)
+            targetPos = targetPos + self.Target:getVelocity() * ttr
+        end
+        
+        targetAngle = (targetPos - self.Instance:getPos()):getAngle()
+    elseif self.FinStabilized then
+        local vel = self.Instance:getVelocity()
+        
+        if vel:getLength() > 10 then
+            targetAngle = vel:getAngle()
+        end
+    end
+    
+    if self.Wobble.Speed ~= 0 then
+        
+        local offset = Angle(
+            math.sin( timer.curtime()*math.pi*self.Wobble.Speed*self.WobbleDir + self.WobbleSeed )*self.Wobble.Power,
+            math.cos( timer.curtime()*math.pi*self.Wobble.Speed*self.WobbleDir + self.WobbleSeed )*self.Wobble.Power,
+            0
+        ) * math.min( (timer.curtime() - self.LaunchTime), 1 )
+        
+        if self.Target then
+            local targetDistance = self.Instance:getPos():getDistance(self:getTargetPos())
+            local reduce = math.min( targetDistance / self.Instance:getVelocity():getLength() / 2, 1 )
+            offset = offset * reduce
+        end
+        
+        
+        targetAngle = targetAngle + offset
+    end
+    
+    
+    if targetAngle ~= self.LaunchAngle then
+        --[[local _, targetAngleFinal = localToWorld( Vector(), -self.ModelAngle, Vector(), targetAngle )
+        
+        local inertiaVec = self.Instance:getInertia()
+        local inertia = Angle( inertiaVec.y, inertiaVec.z, inertiaVec.x )
+        
+        local localAng = self.Instance:worldToLocalAngles(targetAngleFinal)
+        --localAng.p = math.clamp(localAng.p, -15, 15)
+        --localAng.y = math.clamp(localAng.y, -15, 15)
+        
+        self.Instance:applyAngForce( (localAng*100 - self.Instance:getAngleVelocityAngle()*10) * inertia )]]
+        
+        -- okay, new and improved method:
+        
+        --TODO: fix this mess for non-zero modelAngles
+        --print(targetAngle)
+        local _, targetAngleFinal = localToWorld( Vector(), -self.ModelAngle, Vector(), targetAngle )
+        local lAng = self.Instance:worldToLocalAngles( targetAngleFinal )
+        --[[print(targetAngleFinal)
+        
+        Debug.vector( "to", self.Instance:getPos(), targetAngle:getForward(), Color(255,0,0) )
+        --local targetAngleFinal = self.Instance:worldToLocalAngles( targetAngle )
+        --local _, lAng = localToWorld( Vector(), -self.ModelAngle, Vector(), targetAngleFinal )
+        
+        --local _, targetAngleFinal = localToWorld( Vector(), -self.ModelAngle, Vector(), targetAngle )
+        --local lAng = self.Instance:worldToLocalAngles( targetAngleFinal )
+        Debug.vector( "to2", self.Instance:getPos(), targetAngleFinal:getForward(), Color(0,0,255) )
+        Debug.vector( "to3", self.Instance:getPos(), lAng:getForward(), Color(0,255,0) )
+        ]]
+        
+        lAng.r = 0
+        
+        lAng.p = math.clamp( lAng.p, -self.Guidance.ClampCone, self.Guidance.ClampCone ) * (1 / self.Guidance.ClampCone) * self.Guidance.TurnRate
+        lAng.y = math.clamp( lAng.y, -self.Guidance.ClampCone, self.Guidance.ClampCone ) * (1 / self.Guidance.ClampCone) * self.Guidance.TurnRate
+        
+        self.Instance:setAngleVelocity( Vector( lAng.r, lAng.p, lAng.y ) )
+        
+    end
+    
+    self:onThink( dt )
+    
+end
+
+
+
+--[[ Explosion ratelimit patcher ]]--
+
+Projectile.NextDetonation = {}
+Projectile.EXPLOSION_RATELIMIT = {
+    ["models/props_phx/oildrum001_explosive.mdl"] = 0.1,
+    ["models/props_c17/oildrum001_explosive.mdl"] = 0.1
+}
+
+--TODO: make sure server UUID doesnt change with restarts/addon changes
+local IS_CFC = wire.serverUUID() == "1c17c305-2132-4428-840e-3f4cb52f9705"
+local BLAST_RADIUS = 180
+
+local function canDetonate( ent )
+    return not IS_CFC or timer.curtime() > (Projectile.NextDetonation[ent:getModel()] or 0)
+end
+
+-- Breaks a prop while tagging you for the kill credit
+-- Also will not explosion ratelimit you, at the cost of not tagging your kills.
+function Projectile.taggedBreak( ent, forceTag )
+    local mdl = ent:getModel()
+    local wasTagged = false
+    
+    --[[if IS_CFC then
+        -- Don't tag if the ratelimiter is on cooldown
+        if canDetonate( ent ) then
+            local actuallyTag = forceTag
+            
+            -- only tag if its near a player
+            if not actuallyTag then
+                for i,v in pairs(find.allPlayers()) do
+                    if v:isAlive() and v:isInPvp() and v:getPos():getDistance( ent:getPos() ) < BLAST_RADIUS then
+                        actuallyTag = true
+                        break
+                    end
+                end
+            end
+            
+            -- okay search for NPCs next
+            if not actuallyTag then
+                for i,v in pairs(find.byClass("npc_*")) do
+                    if v:getHealth() > 0 and v:getPos():getDistance( ent:getPos() ) < BLAST_RADIUS then
+                        actuallyTag = true
+                        break
+                    end
+                end
+            end
+            
+            
+            if actuallyTag then
+                ent:applyDamage(10, owner(), owner(), DAMAGE.BLAST)
+                Projectile.NextDetonation[ent:getModel()] = timer.curtime() + (Projectile.EXPLOSION_RATELIMIT[mdl] or 0.5)
+                wasTagged = true
+            end
+        end
+    else]]
+        ent:applyDamage(10, owner(), owner(), DAMAGE.BLAST)
+        wasTagged = false
+    --end
+    
+    ent:breakEnt()
+    
+    return wasTagged
+end
+
+
+
+
+-- Explodes the projectile
+function Projectile:detonate( dontBreak, collision )
+    if self.Detonated then return end
+    
+    self.Enabled = false
+    self.Detonated = true
+    
+    local hitUnfrozenProp = collision and isValid(collision.HitEntity) and not collision.HitEntity:isFrozen()
+    
+    if self.ExplosionPower > 0 then
+        Util.spawn(function()
+            local origin = self.Instance:getPos()
+            local normal = Vector(0,0,1)
+            
+            if collision then
+                local hitTraceInfo = trace.line( self.Instance:getPos(), self.Instance:getPos() + (collision.HitPos - self.Instance:getPos())*2, self.Instance )
+                
+                origin = hitTraceInfo.HitPos
+                normal = hitTraceInfo.HitNormal
+            end
+            
+            local radius = 50*math.sqrt(self.ExplosionPower)
+            
+            for i,v in pairs(self.SupplementaryExplosives) do
+                if not isValid(v) then continue end
+                
+                local a = math.random()*360
+                
+                -- im so sorry for this monstrosity
+                local ang3d = hitUnfrozenProp and Angle(math.random(),math.random(),0)*360 or normal:getAngle():getUp():getAngle():rotateAroundAxis(normal, a)
+                local p = origin + ang3d:getForward()*(math.random(20, radius))
+                
+                v:setParent(nil)
+                v:setPos(p)
+                
+                local tagged = Projectile.taggedBreak(v, hitUnfrozenProp)
+                
+                -- wait 0.1s for the explosion ratelimiter
+                -- why does this even exist :despair:
+                if tagged then
+                    Util.wait(0.1)
+                end
+            end
+        end)
+    end
+    
+    if isValid(self.Instance) and not dontBreak then
+        Projectile.taggedBreak( self.Instance, hitUnfrozenProp )
+    end
+    
+    if effect.canCreate() then
+        self:playExplosionEffect()
+    end
+    
+    self:onDetonate( collision )
+    
+    table.removeByValue(Projectile.Instances, self)
+    hook.run("ProjectileRemoved", self)
+end
+
+
+function Projectile:isValid()
+    return isValid(self.Instance)
+end
+
+
+function Projectile:remove()
+    if self:isValid() then
+        if self.Explosive then
+            self.Instance:remove()
+            self.Detonated = true
+        else
+            if FadeOutTime == 0 then
+                self.Instance:remove()
+            else
+                Util.fadeRemove( self.Instance, self.FadeOutTime, false, self.removeCallback )
+            end
+        end
+    end
+    
+    self.Enabled = false
+    
+    table.removeByValue(Projectile.Instances, self)
+    
+    hook.run("ProjectileRemoved", self)
+end
+
+
+
+local lastThink = timer.curtime()
+
+timer.create("Projectile_Think", 0.1, 0, function()
+    local dt = timer.curtime() - lastThink
+    
+    for i,v in pairs(Projectile.Instances) do
+        v:think( dt )
+    end
+    
+    lastThink = timer.curtime()
+end)
+
+
+hook.add("EntityRemoved", "Projectile_Removal", function( e )
+    if not e.Projectile then return end
+    
+    if e.Projectile.Explosive then 
+        e.Projectile:detonate( true )
+    else
+        e.Projectile:remove()
+    end
+end)
+
+
+
+
+return Projectile
+

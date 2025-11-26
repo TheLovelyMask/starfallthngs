@@ -1,0 +1,277 @@
+--@name Chat Command Parser
+--@author shroobloom
+--@shared
+--@include sb/command_parser.txt
+--@include sb/util.txt
+
+
+
+--TODO: Make ^ a valid input for player
+--TODO: players type which allows multi-selection
+
+
+local CommandParser = require("sb/command_parser.txt")
+local Util = require("sb/util.txt")
+
+
+local ChatCommand = class("ChatCommandParser", CommandParser)
+ChatCommand.Instance = nil
+
+ChatCommand.BULLET_COLOR = Color(36,36,36)
+ChatCommand.BULLET = string.char(226) .. string.char(128) .. string.char(162)
+ChatCommand.BRACKET = "-"
+
+--[[
+hook.add("playersay", "", function(plr, msg)
+    if plr ~= owner() then return end
+    
+    for i=1, msg:len() do
+        print(string.byte(msg:sub(1,1)))
+    end
+end)]]
+
+
+local TYPE_COLOURS = {
+    ["string"]  = Color(255,255,144),
+    ["number"]  = Color(90,200,255),
+    ["int"]     = Color(140,240,255),
+    ["player"]  = Color(90,255,100),
+    ["players"] = Color(140,255,90),
+    ["bool"]    = Color(200,144,255),
+    ["any"]     = Color(255,120,100)
+}
+
+
+ChatCommand.UsePredicates = {
+    ANYONE = function( user )
+        return true
+    end,
+    
+    OWNER_ONLY = function( user )
+        return user == owner()
+    end,
+    
+    ADMIN_ONLY = function( user )
+        return user:isAdmin()
+    end
+}
+
+
+local CommandDataStructMixin = {
+    CanUse = ChatCommand.UsePredicates.OWNER_ONLY
+}
+
+
+function ChatCommand:applyCommandDefaults( cmdData )
+    CommandParser.applyCommandDefaults( self, cmdData )
+    Util.applyDefaults(cmdData, CommandDataStructMixin)
+end
+
+
+
+
+local getHelp
+getHelp = function( cmdData, scope )
+    scope = scope or 0
+    
+    local indent = string.rep("      ", scope)
+    
+    local out = {Color(255,255,255), indent, Color(255,255,144), cmdData.Name, Color(255,255,255), " - ", Color(110,255,110), cmdData.Description}
+    
+    if scope ~= 0 then
+        table.insert(out, 3, ChatCommand.BULLET_COLOR)
+        table.insert(out, 4, ChatCommand.BULLET .. " ")
+        
+        for i,v in pairs(cmdData.Aliases) do
+            out[6] = out[6] .. "/" .. v
+        end
+    end
+    
+    if #cmdData.Aliases > 0 and scope == 0 then
+        Util.bulkPush( out, "\n" .. indent, ChatCommand.BULLET_COLOR, ChatCommand.BRACKET, Color(255,255,255), " Aliases: " )
+        
+        for i,v in pairs(cmdData.Aliases) do
+            Util.bulkPush( out, Color(255,255,144), v )
+            
+            if i < #cmdData.Aliases then
+                Util.bulkPush( out, Color(255,255,255), ", " )
+            end
+        end
+        
+        table.insert(out, Color(255,255,255))
+    end
+    
+    if #cmdData.Subcommands > 0 then
+        Util.bulkPush( out, "\n" .. indent, ChatCommand.BULLET_COLOR, ChatCommand.BRACKET, Color(255,255,255), " Subcommands: " )
+        
+        for i,v in pairs(cmdData.Subcommands) do
+            local components = getHelp( v, scope + 1 )
+            
+            table.insert(out, "\n")
+            
+            for i,c in pairs(components) do
+                table.insert(out, c)
+            end
+        end
+    elseif #cmdData.Arguments > 0 then
+        Util.bulkPush( out, "\n" .. indent, ChatCommand.BULLET_COLOR, ChatCommand.BRACKET, Color(255,255,255), " Arguments: " )
+        
+        for i,v in pairs(cmdData.Arguments) do
+            Util.bulkPush( out, Color(255,255,255), "\n        " .. indent, TYPE_COLOURS[v.Type] or Color(200,144,255), v.Type .. " ", Color(255,255,255), v.Name )
+            
+            if v.Optional then
+                Util.bulkPush( out, Color(100,100,100), " (Optional)" )
+            end
+        end
+    end
+    
+    return out
+end
+
+
+function ChatCommand:registerDefaultCommands()
+    self:add({
+        Name = "help",
+        Description = "Displays all available commands.",
+        Arguments = {
+            {
+                Name = "command",
+                Type = "string",
+                Optional = true,
+                Validator = function( arg )
+                    if not self:get( arg ) then
+                        return CommandParser.Error( "Unknown command \"" .. arg .. "\"." )
+                    end
+                end
+            }
+        },
+        Run = function( user, command )
+            if not command then
+                local out = {Color(255,255,255), "-----------= Help =-----------"}
+                
+                for i,v in pairs(self.Commands) do
+                    local argList = ""
+                    
+                    if v.Arguments then
+                        for i,v in pairs(v.Arguments) do
+                            argList = argList .. string.format("<" .. v.Name .. (v.Optional and "?" or "") .. "> ")
+                        end
+                    end
+                    
+                    table.insert(out, "\n")
+                    table.insert(out, ChatCommand.BULLET_COLOR)
+                    table.insert(out, ChatCommand.BULLET)
+                    table.insert(out, Color(255,255,255))
+                    table.insert(out, " " .. v.Name .. " " .. argList)
+                end
+                
+                self:log(unpack(out))
+            else
+                
+                local cmdData = self:get( command )
+                local out = {ChatCommand.BULLET_COLOR, ChatCommand.BULLET, Color(255,255,255), " Help: "}
+                local components = getHelp(cmdData)
+                for i,c in pairs(components) do
+                    table.insert(out, c)
+                end
+                
+                self:log(unpack(out))
+            end
+        end
+    })
+end
+
+
+
+
+
+--TODO: allow for clientside commands too?
+if SERVER then
+    local prefixes = {
+        ["!"] = true,
+        ["/"] = true
+    }
+    
+    hook.add("PlayerSay", "chat_command_parse", function( ply, text )
+        if not prefixes[text:sub(1,1)] then return end
+        
+        local cmd, args, err = ChatCommand.Instance:parse( text:sub( 2 ), nil, ply )
+        if cmd and not cmd.CanUse( ply ) then return end
+        
+        if err then
+            timer.simple(0, function()
+                ply:chatPrint(ChatCommand.BULLET_COLOR, ChatCommand.BULLET, Color(234,60,40), " Syntax Error: ", Color(255,120,120), err.Message)
+            end)
+            
+            return ""
+        end
+        
+        if cmd then
+            if not err then
+                err = cmd.Run( ply, unpack(args) )
+                
+                if err then
+                    timer.simple(0, function()
+                        ply:chatPrint(ChatCommand.BULLET_COLOR, ChatCommand.BULLET, Color(234,60,40), " Command Error: ", Color(255,120,120), err.Message)
+                    end)
+                end
+            end
+            
+            return ""
+        end
+    end)
+end
+
+
+
+ChatCommand.Instance = ChatCommand:new()
+ChatCommand.Instance.ErrorForUnknownCommand = false
+
+
+--[[
+ChatCommand.Instance:add({
+    Name = "test",
+    Description = "Subcommand test.",
+    Arguments = {
+        {
+            Name = "value",
+            Type = "any"
+        },
+    },
+    Subcommands = {
+        {
+            Name = "sub",
+            Description = "Subcommand example A",
+            Aliases = {"a"},
+            Arguments = {
+                {
+                    Name = "Amount",
+                    Type = "int"
+                }
+            },
+            Run = function( user, amt )
+                ChatCommand.Instance:log(Color(200,60,50), "Ran with example A: ", amt)
+            end
+        },
+        {
+            Name = "sub2",
+            Description = "Subcommand example B",
+            Aliases = {"b"},
+            Arguments = {
+                {
+                    Name = "Target",
+                    Type = "player"
+                }
+            },
+            Run = function( user, target )
+                ChatCommand.Instance:log(Color(60,200,50), "Ran with example B: ", target)
+            end
+        }
+    },
+    Run = function( user, val )
+        ChatCommand.Instance:log(Color(0,255,0), "Ran with no subcommand.", val, type(val))
+    end
+})]]
+
+
+return ChatCommand.Instance

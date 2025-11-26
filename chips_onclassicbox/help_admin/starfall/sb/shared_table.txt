@@ -1,0 +1,169 @@
+--@name Shared Table
+--@author shroobloom
+--@shared
+--@include sb/util.txt
+
+
+
+--[[
+    shared_table.lua
+    
+    This library allows you to sync a table between multiple chips.
+    Do not use table.insert with this; it internally uses rawset!
+    (i assume table.remove, removeByValue, etc. are the same)
+    Instead use the :insert method.
+    
+    Hooks:
+    - sharedTable_changed( self, key, value ) - Fired when a table is modified.
+]]--
+
+
+
+-- TODO
+-- [ ] Make functions call remotely if they're replicated?
+
+
+
+local Util = require("sb/util.txt")
+local SharedTable = class("SharedTable")
+SharedTable.Instances = {}
+SharedTable.DEFAULT_KEYS = {
+    ID = true, Contents = true, Networked = true, Crosschip = true
+}
+
+
+--TODO: metamethod stored sub-tables to auto-sync deep tables?
+
+function SharedTable:initialize( id, Networked, Crosschip )
+    
+    -- Modes
+    self.Networked = Networked
+    
+    if Crosschip ~= nil then
+        self.Crosschip = Crosschip
+    else
+        self.Crosschip = true
+    end
+    
+    self.ID = id
+    self.Contents = self.Crosschip and Util.fireRemote("sb_st_requestContents", id) or {}
+    
+    SharedTable.Instances[id] = self
+end
+
+
+function SharedTable:getOrCreate( id )
+    return SharedTable.Instances[id] or SharedTable:new( id )
+end
+
+
+
+function SharedTable:__newindex( key, value )
+    if SharedTable.DEFAULT_KEYS[key] then
+        return rawset(self, key, value)
+    end
+    
+    self.Contents[key] = value
+    
+    if self.Crosschip then
+        Util.fireRemote("sb_st_newindex", self.ID, key, value)
+    end
+    
+    if self.Networked then
+        net.start("sb_st_newindex")
+        net.writeString(self.ID)
+        net.writeType(key)
+        net.writeType(value)
+        net.send()
+    end
+    
+    hook.run("sharedTable_changed", self, key, value)
+end
+
+
+function SharedTable:__index( key, value )
+    if SharedTable.DEFAULT_KEYS[key] then
+        return rawget(self, key, value)
+    end
+    
+    return self.Contents[key]
+end
+
+
+function SharedTable:update()
+    for i,v in pairs(self.Contents) do
+        self:__newindex( i, v )
+    end
+end
+
+
+function SharedTable:insert( keyOrValue, value )
+    if value == nil then
+        value = keyOrValue
+        keyOrValue = #self.Contents + 1
+    end
+    
+    self[keyOrValue] = value
+end
+
+
+
+Util.bindRemote("sb_st_requestContents", function(id)
+    local t = SharedTable.Instances[id]
+    if not t or not t.Crosschip then return end
+    
+    return t.Contents
+end)
+
+
+if SERVER then
+    hook.add("ClientInitialized", "sb_st_sendContents", function( ply )
+        for i,v in pairs(SharedTable.Instances) do
+            if not v.Networked then continue end
+            
+            net.start("sb_st_sendContents")
+            net.writeString( v.ID )
+            net.writeTable( v.Contents )
+            net.send( ply )
+        end
+    end)
+end
+
+
+
+Util.bindRemote("sb_st_newindex", function(id, key, value)
+    local t = SharedTable.Instances[id]
+    if not t or not t.Crosschip then return end
+    
+    rawset(t.Contents, key, value)
+    hook.run("sharedTable_changed", t, key, value)
+end)
+
+
+
+if CLIENT then
+    net.receive("sb_st_newindex", function()
+        local id = net.readString()
+        local t = SharedTable.Instances[id]
+        if not t or not t.Networked then return end
+        
+        local key = net.readType()
+        local value = net.readType()
+        
+        rawset(t.Contents, key, value)
+        hook.run("sharedTable_changed", self, key, value)
+    end)
+    
+    net.receive("sb_st_sendContents", function()
+        local id = net.readString()
+        local t = SharedTable.Instances[id]
+        if not t or not t.Networked then return end
+        
+        t.Contents = net.readTable()
+        hook.run("sharedTable_changed", self, key, value)
+    end)
+end
+
+
+
+return SharedTable
