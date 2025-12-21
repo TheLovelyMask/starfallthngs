@@ -1,0 +1,304 @@
+--@name sfmdv2.1_chips
+--@author thelovelymask (modified)
+--@shared
+--@model models/props_lab/huladoll.mdl
+    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+local disablePlayerESP  = true  -- Player ESP is now disabled
+local disableChipMenu   = false -- Disable pressing K to view all e2s and sfs
+local showChipHealthbars = true -- Show CPU usage bars on chip ESP
+local cpuBarLength      = 75    -- How long the CPU usage bars are
+
+-- Options for the K menu, sizing, position etc.
+local offset  = {x = 0, y = 200} -- x and y offset for the panel
+local spacing = 18 -- spacing on the K menu, between chips and owners
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+if SERVER then
+    
+    local function getQuota(ent)
+        local quota
+        quota = ent:getQuotaAverage()
+        quota = math.round((quota or 0) * 1000000)
+        return quota
+    end
+    
+    local function genPlyChipTbl()
+        
+        local plys, height = {}, 0
+
+        for _, ply in pairs(find.allPlayers()) do
+            if not isValid(ply) then continue end 
+            plys[ply] = {sfs = {}, e2s = {}, totalcpu = 0} 
+        end
+        
+        for _, sf in pairs(find.byClass('starfall_processor')) do
+            if not isValid(sf) then continue end
+            if not plys[sf:getOwner()].sfs then continue end
+            
+            local label 
+            local cpu = getQuota(sf)
+            if sf:getChipName() == '' then label = '<no name>' else label = sf:getChipName() end 
+            plys[sf:getOwner()].sfs[#plys[sf:getOwner()].sfs+1] = {name = label, owner = sf:getOwner(), usage = cpu, ent = sf} 
+            plys[sf:getOwner()].totalcpu = plys[sf:getOwner()].totalcpu + cpu
+        end
+        
+        for _, e2 in pairs(find.byClass('gmod_wire_expression2')) do
+            if not isValid(e2) then continue end
+            if not plys[e2:getOwner()].e2s then continue end 
+            
+            local label 
+            local cpu = getQuota(e2)
+            if e2:getChipName() == '' then label = '<no name>' else label = e2:getChipName() end 
+            plys[e2:getOwner()].e2s[#plys[e2:getOwner()].e2s+1] = {name = label, owner = e2:getOwner(), usage = cpu, ent = e2}
+            plys[e2:getOwner()].totalcpu = plys[e2:getOwner()].totalcpu + cpu
+        end
+        
+        for ply, chips in pairs(plys) do
+            if #chips.sfs > 0 or #chips.e2s > 0 then height = height + 1 end
+            height = height + #chips.sfs + #chips.e2s
+        end
+        
+        net.start('transfertable')
+        net.writeTable(plys)
+        net.writeInt(height, 16)
+        net.send() 
+    end
+    
+    if not disableChipMenu then
+        timer.create('refreshchips', 1, 0, function()
+            genPlyChipTbl()
+        end)
+    end
+    
+    -- Chat command handler
+    hook.add('PlayerSay', 'chipESPToggle', function(ply, text)
+        if ply ~= owner() then return end
+        if text == '-chips' then
+            net.start('toggleChipESP')
+            net.send(owner())
+            return ''
+        end
+    end)
+    
+end
+
+if CLIENT then
+    
+    -- Setup font for text rendering
+    local font = render.createFont(
+        'FontAwesome',
+        18,
+        800,
+        false,
+        false,
+        true,
+        true,
+        0,
+        false,
+        0
+    )
+    render.setFont(font)
+    
+    local tbl, wHeight = {}, 0
+    local chipESPEnabled = true
+    
+    net.receive('transfertable', function()
+        tbl = net.readTable() 
+        wHeight = net.readInt(16)
+    end)
+    
+    net.receive('toggleChipESP', function()
+        chipESPEnabled = not chipESPEnabled
+        print(Color(0, 255, 255), '[Chip ESP] ', Color(255, 255, 255), chipESPEnabled and 'Enabled' or 'Disabled')
+    end)
+    
+    if player() == owner() then
+        enableHud(owner(), true)
+    end
+    
+    -- Function to get quota same way as server
+    local function getQuota(ent)
+        local quota
+        pcall(function() quota = ent:getQuotaAverage() end)
+        quota = math.round((quota or 0) * 1000000)
+        return quota
+    end
+    
+    -- Chip ESP - Draw wireframe boxes around chips
+    hook.add('postdrawopaquerenderables', 'drawchipbox', function()
+        if not chipESPEnabled then return end
+        
+        -- Draw SF chips
+        for _, sf in pairs(find.byClass('starfall_processor')) do
+            if not isValid(sf) or sf == chip() then continue end
+            
+            local mins, maxs = sf:obbMins(), sf:obbMaxs()
+            
+            render.setColor(Color(0, 255, 255))
+            render.draw3DWireframeBox(sf:getPos(), sf:getAngles(), mins, maxs)
+        end
+        
+        -- Draw E2 chips
+        for _, e2 in pairs(find.byClass('gmod_wire_expression2')) do
+            if not isValid(e2) then continue end
+            
+            local mins, maxs = e2:obbMins(), e2:obbMaxs()
+            
+            render.setColor(Color(255, 0, 0))
+            render.draw3DWireframeBox(e2:getPos(), e2:getAngles(), mins, maxs)
+        end
+        
+    end)
+    
+    hook.add('drawhud', 'drawchipesp', function()
+        if not chipESPEnabled then return end
+        
+        -- Draw SF chips info
+        for _, sf in pairs(find.byClass('starfall_processor')) do
+            if not isValid(sf) or sf == chip() then continue end
+            
+            local owner = sf:getOwner()
+            local chipName = sf:getChipName()
+            if chipName == '' then chipName = '<no name>' end
+            
+            local ownerName = isValid(owner) and owner:getName() or '<no owner>'
+            local xycoords = sf:getPos():toScreen()
+            
+            if xycoords.visible then
+                
+                -- Draw chip type and name
+                render.setColor(Color(0, 255, 255))
+                render.drawText(xycoords.x, xycoords.y - 10, '[SF] ' .. chipName, 1)
+                
+                -- Draw owner name
+                local ownerColor = isValid(owner) and team.getColor(owner:getTeam()) or Color(255, 255, 255)
+                render.setColor(ownerColor)
+                render.drawText(xycoords.x, xycoords.y + 5, ownerName, 1)
+                
+                -- Draw CPU usage bar
+                if showChipHealthbars then
+                    local quota = getQuota(sf)
+                    
+                    local cpuPercent = math.clamp(quota / 2000, 0, 1) -- 2000us = max
+                    
+                    render.setColor(Color(255, 0, 0))
+                    render.drawRectFast(xycoords.x - cpuBarLength/2, xycoords.y + 20, cpuBarLength, 5)
+                    render.setColor(Color(0, 255, 0))
+                    render.drawRectFast(xycoords.x - cpuBarLength/2, xycoords.y + 20, cpuBarLength * (1 - cpuPercent), 5)
+                    
+                    -- Draw CPU usage text
+                    render.setColor(Color(255, 255, 255))
+                    render.drawText(xycoords.x, xycoords.y + 28, quota .. 'us', 1)
+                end
+                
+            end
+            
+        end
+        
+        -- Draw E2 chips info
+        for _, e2 in pairs(find.byClass('gmod_wire_expression2')) do
+            if not isValid(e2) then continue end
+            
+            local owner = e2:getOwner()
+            local chipName = e2:getChipName()
+            if chipName == '' then chipName = '<no name>' end
+            
+            local ownerName = isValid(owner) and owner:getName() or '<no owner>'
+            local xycoords = e2:getPos():toScreen()
+            
+            if xycoords.visible then
+                
+                -- Draw chip type and name
+                render.setColor(Color(255, 0, 0))
+                render.drawText(xycoords.x, xycoords.y - 10, '[E2] ' .. chipName, 1)
+                
+                -- Draw owner name
+                local ownerColor = isValid(owner) and team.getColor(owner:getTeam()) or Color(255, 255, 255)
+                render.setColor(ownerColor)
+                render.drawText(xycoords.x, xycoords.y + 5, ownerName, 1)
+                
+                -- Draw CPU usage bar
+                if showChipHealthbars then
+                    local quota = getQuota(e2)
+                    
+                    local cpuPercent = math.clamp(quota / 2000, 0, 1) -- 2000us = max
+                    
+                    render.setColor(Color(255, 0, 0))
+                    render.drawRectFast(xycoords.x - cpuBarLength/2, xycoords.y + 20, cpuBarLength, 5)
+                    render.setColor(Color(0, 255, 0))
+                    render.drawRectFast(xycoords.x - cpuBarLength/2, xycoords.y + 20, cpuBarLength * (1 - cpuPercent), 5)
+                    
+                    -- Draw CPU usage text
+                    render.setColor(Color(255, 255, 255))
+                    render.drawText(xycoords.x, xycoords.y + 28, quota .. 'us', 1)
+                end
+                
+            end
+            
+        end
+        
+    end)
+    
+    -- K Menu - List all chips by owner
+    if not disableChipMenu then
+        
+        hook.add('drawhud', 'drawkmenu', function()
+            
+            local x, y = render.getGameResolution()
+            local counter = 0
+        
+            if input.isKeyDown(KEY.K) then
+                
+                local xstart = x/2 - x/8 + offset.x
+                
+                if tbl then
+                    render.setColor(Color(0, 0, 0, 245))
+                    render.drawRect(xstart, offset.y, x/4, 12 + spacing * wHeight)
+                    
+                    for ply, chips in pairs(tbl) do
+                        if #chips.sfs < 1 and #chips.e2s < 1 then continue end 
+                        if not isValid(ply) then continue end 
+                        
+                        render.setColor(team.getColor(ply:getTeam()))
+                        render.drawText(xstart + offset.x + 10, 5 + offset.y + spacing * counter, ply:getName(), 0)
+                        render.setColor(Color(255 * (math.clamp(chips.totalcpu, 0, 4000) / 4000), 0 + 255 * (1 - math.clamp(chips.totalcpu, 0, 4000) / 4000), 0))
+                        render.drawText(xstart - 55 + offset.x + xstart/1.5, 5 + offset.y + spacing * counter, tostring(chips.totalcpu) .. 'us', 2)
+                        render.setColor(Color(255, 255, 255))
+                        render.drawText(xstart - 10 + offset.x + xstart/1.5, 5 + offset.y + spacing * counter, 'Total', 2)
+                        
+                        counter = counter + 1
+                        if #chips.sfs > 0 then
+                            for _, sf in pairs(chips.sfs) do
+                                counter = counter + 1 
+                                
+                                render.setColor(Color(0, 255, 255))
+                                render.drawText(xstart + offset.x + 20, 5 + offset.y + spacing * (counter - 1), '(SF)', 0)
+                                render.setColor(Color(255, 255, 255))
+                                render.drawText(xstart + offset.x + 56, 5 + offset.y + spacing * (counter - 1), sf.name or '<no name detected>', 0)
+                                render.setColor(Color(255 * (math.clamp(sf.usage, 0, 2000) / 2000), 0 + 255 * (1 - math.clamp(sf.usage, 0, 2000) / 2000), 0))
+                                render.drawText(xstart - 10 + offset.x + xstart/1.5, 5 + offset.y + spacing * (counter - 1), tostring(sf.usage) .. 'us', 2)
+                            end
+                        end
+                        if #chips.e2s > 0 then
+                            for _, e2 in pairs(chips.e2s) do
+                                counter = counter + 1
+                                
+                                render.setColor(Color(255, 0, 0))
+                                render.drawText(xstart + offset.x + 20, 5 + offset.y + spacing * (counter - 1), '[E2]', 0)
+                                render.setColor(Color(255, 255, 255))
+                                render.drawText(xstart + offset.x + 56, 5 + offset.y + spacing * (counter - 1), e2.name or '<no name detected>', 0)
+                                render.setColor(Color(255 * (math.clamp(e2.usage, 0, 2000) / 2000), 0 + 255 * (1 - math.clamp(e2.usage, 0, 2000) / 2000), 0))
+                                render.drawText(xstart - 10 + offset.x + xstart/1.5, 5 + offset.y + spacing * (counter - 1), tostring(e2.usage) .. 'us', 2)
+                            end
+                        end
+                    end 
+                end
+                
+            end
+        
+        end)
+        
+    end
+    
+end

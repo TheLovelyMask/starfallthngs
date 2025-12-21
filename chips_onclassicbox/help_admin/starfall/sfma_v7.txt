@@ -12,12 +12,57 @@ local SFMA = {}
 --[[ CONFIG ]]--
 SFMA.SpectateKey = "h"
 
+-- Physics lag detection config
+SFMA.PhysicsLag = {
+    enabled = true,
+    checkRate = 0.15,               -- how often to check for lag (seconds)
+    freezeThreshold = 0.75,         -- 75% of props frozen = lag detected
+    minPropsForDetection = 20,      -- minimum props on map to enable detection
+    scanCooldown = 10,              -- seconds between lag reports
+    
+    -- Scoring weights for offender detection
+    weights = {
+        constraints = 0.05,          -- points per constraint
+        velocitySpike = 100,          -- points per velocity spike
+        heavyProp = 1.5,            -- points per heavy prop (>500kg)
+        recentSpawn = 3,            -- points per recent spawn
+        whiteProp = 100,              -- points per white-colored prop (lag indicator)
+        collisions = 100              -- points per collision
+    },
+    
+    heavyPropMass = 500,            -- kg threshold for "heavy" prop
+    recentSpawnWindow = 5,          -- seconds to consider "recent"
+    velocitySpikeThreshold = 2000,  -- velocity change to count as spike
+}
+
+-- Impact debug config
+SFMA.ImpactDebug = {
+    enabled = false,
+    hitboxRadius = 500,             -- radius to show hitboxes around owner
+    impactLifetime = 5,             -- seconds impacts stay visible
+    bulletTraceColor = Color(0,255,0),
+    hitImpactColor = Color(255,0,0),
+    missImpactColor = Color(0,100,255)
+}
+
+-- HUD notification config (client-side will respect this)
+SFMA.HUD = {
+    x = 18,                 -- left margin (horizontal)
+    -- y will be computed each frame to be vertically centered
+    lineHeight = 24,        -- spacing between messages (pixels)
+    defaultDuration = 10.0,  -- seconds each message lives
+    maxMessages = 3,       -- cap kept for internal queue
+    bgWidth = 420,          -- background rect width
+    bgHeight = 22           -- background rect height per message
+}
+
 function SFMA.consoleLog( ... )
-    printConsole( Color(231, 55, 62), "[SFMA v6] ", Color(255,255,255), ... )
+    printConsole( Color(231, 55, 62), "[SFMA v7] ", Color(255,255,255), ... )
 end
 
+-- keep chatLog available but we'll avoid calling it for keypress notifications
 function SFMA.chatLog( ... )
-    print( Color(231, 55, 62), "[SFMA v6] ", Color(255,255,255), ... )
+    print( Color(231, 55, 62), "[SFMA v7] ", Color(255,255,255), ... )
 end
 
 local function getColor( plr )
@@ -30,8 +75,8 @@ end
 
 local TRUSTED = {
     ["operator"] = true,
-    ["admin"] = false,
-    ["Moderator"] = false,
+    ["admin"] = true,
+    ["admin_senior"] = true,
     ["none"] = false
 }
 
@@ -46,20 +91,16 @@ local suspiciousKeys = {
     [KEY.PAGEDOWN] = "PAGEDOWN",
     [KEY.PAUSE]    = "PAUSE",
     [KEY.PAD_ENTER]= "PAD_ENTER",
-    --[KEY.F2]       = "F2",
     [KEY.F5]       = "F5",
     [KEY.F7]       = "F7",
     [KEY.F8]       = "F8",
     [KEY.F9]       = "F9",
     [KEY.F10]      = "F10",
-    --[KEY.F11]      = "F11",
     [KEY.F12]      = "F12",
     [KEY.KP_HOME]  = "KP_HOME",
     [KEY.KP_DEL]   = "KP_DEL",
     [KEY.RSHIFT]   = "RSHIFT",
-    [KEY.RALT]     = "RALT",
-    [KEY.INS]      = "INS", -- duplicate safe entry
-    [KEY.DELETE]   = "DELETE"
+    [KEY.RALT]     = "RALT"
 }
 
 local lastKeyTime = {} -- per-player cooldown
@@ -83,11 +124,12 @@ function SFMA.logOffender( plr, ping )
     end)
 
     if SERVER then
+        -- send net to owner only (owner receives and will show HUD)
         pcall(function()
             net.start("SFMA_logOffender")
             net.writeEntity(plr)
             net.writeBool(ping)
-            net.send(owner()) -- only send to owner
+            net.send(owner())
         end)
     end
 
@@ -204,6 +246,44 @@ ChatCommands:add({
     end
 })
 
+-- physlag command (toggle physics lag detection)
+ChatCommands:add({
+    Name = "physlag",
+    Description = "Toggles physics lag detection system.",
+    Aliases = {"plag", "lagdetect"},
+    Arguments = {
+        { Name = "State", Type = "bool", Optional = true }
+    },
+    Run = function( user, state )
+        if user ~= owner() then return end
+        
+        local newState
+        if state == nil then newState = not SFMA.PhysicsLag.enabled else newState = state end
+        SFMA.PhysicsLag.enabled = newState
+        
+        SFMA.chatLog("Physics lag detection is ", newState and Color(50,255,50) or Color(255,50,50), newState and "enabled" or "disabled", Color(255,255,255), ".")
+    end
+})
+
+-- impacts command (toggle bullet impact and hitbox visualization)
+ChatCommands:add({
+    Name = "impacts",
+    Description = "Toggles bullet impact visualization and hitboxes.",
+    Aliases = {"showimpacts", "bullets"},
+    Arguments = {
+        { Name = "State", Type = "bool", Optional = true }
+    },
+    Run = function( user, state )
+        if user ~= owner() then return end
+        
+        local newState
+        if state == nil then newState = not SFMA.ImpactDebug.enabled else newState = state end
+        SFMA.ImpactDebug.enabled = newState
+        
+        SFMA.chatLog("Impact visualization is ", newState and Color(50,255,50) or Color(255,50,50), newState and "enabled" or "disabled", Color(255,255,255), ".")
+    end
+})
+
 -- eventhost
 SFMA.EventHostMode = false
 ChatCommands:add({
@@ -225,6 +305,392 @@ ChatCommands:add({
 
 -- ======================== SERVER LOGIC ========================
 if SERVER then
+
+    -- ============= PHYSICS LAG DETECTION SYSTEM =============
+    local lastVelocities = {}           -- track velocity changes
+    local collisionCounts = {}          -- track collisions per player
+    local lastLagReport = 0             -- cooldown for lag reports
+    local entitySpawnTimes = {}         -- track when entities were created
+    local canaryProp = nil              -- test prop to detect server freezes
+    local canaryWasFrozen = false       -- track previous freeze state
+    
+    -- Forward declare function
+    local scanForPhysicsOffender
+    
+    -- Create canary prop (falling prop that shouldn't freeze unless server lags)
+    local function createCanaryProp()
+        if not SERVER then return end
+        
+        -- Remove old canary if exists
+        if isValid(canaryProp) then
+            canaryProp:remove()
+        end
+        
+        -- Create prop above chip
+        local chipPos = chip():getPos()
+        local spawnPos = chipPos + Vector(0, 0, 150)
+        
+        canaryProp = prop.create(spawnPos, Angle(0, 0, 0), "models/hunter/blocks/cube025x025x025.mdl", false)
+        
+        if isValid(canaryProp) then
+            canaryProp:setNoDraw(false)  -- Make it invisible
+            canaryProp:setCollisionGroup(COLLISION_GROUP.DEBRIS)  -- Don't collide with players
+            
+            local phys = canaryProp:getPhysicsObject()
+            if phys and phys:isValid() then
+                phys:setMass(10)  -- Light weight
+                phys:wake()
+            end
+        end
+    end
+    
+    -- Monitor canary prop and detect when it gets frozen (= server lag)
+    local function checkCanaryProp()
+        if not isValid(canaryProp) then
+            createCanaryProp()
+            return
+        end
+        
+        local isFrozen = canaryProp:isFrozen()
+        
+        -- Detect freeze transition (was not frozen, now is frozen = LAG!)
+        if isFrozen and not canaryWasFrozen then
+            -- LAG DETECTED!
+            local now = timer.curtime()
+            
+            -- Check cooldown
+            if (now - lastLagReport) >= SFMA.PhysicsLag.scanCooldown then
+                lastLagReport = now
+                scanForPhysicsOffender()
+            end
+        end
+        
+        canaryWasFrozen = isFrozen
+        
+        -- If canary is frozen, unfreeze it to continue monitoring
+        if isFrozen then
+            canaryProp:setFrozen(false)
+            
+            -- Give it a little upward velocity to keep it moving
+            local phys = canaryProp:getPhysicsObject()
+            if phys and phys:isValid() then
+                phys:setVelocity(Vector(0, 0, 100))
+            end
+        end
+        
+        -- If canary fell too far or got stuck, recreate it
+        local chipPos = chip():getPos()
+        local canaryPos = canaryProp:getPos()
+        if canaryPos.z < chipPos.z - 200 or canaryPos.z > chipPos.z + 300 then
+            createCanaryProp()
+        end
+    end
+    
+    -- Track entity creation time
+    hook.add("OnEntityCreated", "SFMA_trackSpawnTime", function(ent)
+        if isValid(ent) then
+            entitySpawnTimes[ent] = timer.curtime()
+        end
+    end)
+    
+    -- Track collisions via damage
+    hook.add("EntityTakeDamage", "SFMA_trackCollisions", function(target, attacker)
+        if not SFMA.PhysicsLag.enabled then return end
+        
+        -- Count physics-based damage (collisions)
+        local isPhysicsDamage = false
+        if isValid(attacker) then
+            local cls = attacker:getClass()
+            if cls == "prop_physics" or cls == "worldspawn" then
+                isPhysicsDamage = true
+            end
+        end
+        
+        if isPhysicsDamage and isValid(target) then
+            local owner = target:getOwner()
+            if isValid(owner) and owner:isPlayer() then
+                collisionCounts[owner] = (collisionCounts[owner] or 0) + 1
+            end
+        end
+    end)
+    
+    -- Scan all entities and find physics lag offender (OPTIMIZED - incremental scanning)
+    scanForPhysicsOffender = function()
+        local now = timer.curtime()
+        local cfg = SFMA.PhysicsLag
+        
+        -- Get all entities
+        local allEnts = find.all()
+        local totalEnts = #allEnts
+        local currentIndex = 1
+        local batchSize = 50  -- Process 50 entities per tick to avoid CPU limit
+        
+        -- Shared state (accessible by both scanBatch and generateReport)
+        local playerScores = {} -- [player] = { score = 0, details = {} }
+        local playerEntityCounts = {} -- [player] = { total = 0, props = 0 }
+        local chipUsage = {} -- Track all chips: { {owner, name, usage, type}, ... }
+        
+        -- Forward declare
+        local generateReport
+        
+        -- Generate and display report
+        generateReport = function()
+            -- Calculate total scores
+            local w = cfg.weights
+            for player, data in pairs(playerScores) do
+                data.score = 
+                    (data.constraints * w.constraints) +
+                    (data.velocitySpikes * w.velocitySpike) +
+                    (data.heavyProps * w.heavyProp) +
+                    (data.recentSpawns * w.recentSpawn) +
+                    (data.whiteProps * w.whiteProp) +
+                    (data.collisions * w.collisions)
+            end
+            
+            -- Sort by score and get top 3
+            local sortedPlayers = {}
+            for player, data in pairs(playerScores) do
+                if data.score > 0 then
+                    table.insert(sortedPlayers, {player = player, data = data})
+                end
+            end
+            
+            table.sort(sortedPlayers, function(a, b) return a.data.score > b.data.score end)
+            
+            -- Report top 3 offenders
+            SFMA.chatLog(Color(255,100,100), "⚠ PHYSICS LAG DETECTED ⚠", Color(255,255,255), " - Top suspects:")
+            
+            if #sortedPlayers > 0 then
+                for i = 1, math.min(3, #sortedPlayers) do
+                    local entry = sortedPlayers[i]
+                    local ply = entry.player
+                    local data = entry.data
+                    
+                    -- Build details string
+                    local details = {}
+                    if data.constraints > 0 then table.insert(details, data.constraints .. " constraints") end
+                    if data.heavyProps > 0 then table.insert(details, data.heavyProps .. " heavy props") end
+                    if data.recentSpawns > 0 then table.insert(details, data.recentSpawns .. " recent spawns") end
+                    if data.whiteProps > 0 then table.insert(details, data.whiteProps .. " white props") end
+                    if data.velocitySpikes > 0 then table.insert(details, data.velocitySpikes .. " velocity spikes") end
+                    if data.collisions > 0 then table.insert(details, data.collisions .. " collisions") end
+                    
+                    local detailStr = table.concat(details, ", ")
+                    
+                    SFMA.chatLog(
+                        Color(255,200,100), "#" .. i, Color(255,255,255), " - ",
+                        getColor(ply), getName(ply), Color(255,255,255),
+                        " (score: ", Color(255,100,100), math.floor(data.score), Color(255,255,255), ") - ",
+                        Color(200,200,200), detailStr
+                    )
+                    
+                    -- Log first offender for spectate
+                    if i == 1 then
+                        SFMA.logOffender(ply, true)
+                    end
+                end
+            else
+                SFMA.chatLog(Color(200,200,200), "No clear offender found based on scoring metrics.")
+            end
+            
+            -- Entity count statistics
+            local sortedEntityCounts = {}
+            for player, counts in pairs(playerEntityCounts) do
+                table.insert(sortedEntityCounts, {player = player, counts = counts})
+            end
+            table.sort(sortedEntityCounts, function(a, b) return a.counts.total > b.counts.total end)
+            
+            SFMA.chatLog(Color(100,200,255), "Entity Statistics", Color(255,255,255), " - Top 3 by entity count:")
+            
+            if #sortedEntityCounts > 0 then
+                for i = 1, math.min(3, #sortedEntityCounts) do
+                    local entry = sortedEntityCounts[i]
+                    local ply = entry.player
+                    local counts = entry.counts
+                    
+                    SFMA.chatLog(
+                        Color(255,200,100), "#" .. i, Color(255,255,255), " - ",
+                        getColor(ply), getName(ply), Color(255,255,255), ": ",
+                        Color(150,255,150), counts.total, Color(255,255,255), " entities (",
+                        Color(255,200,150), counts.props, Color(255,255,255), " props, ",
+                        Color(200,200,255), (counts.total - counts.props), Color(255,255,255), " other)"
+                    )
+                end
+            else
+                SFMA.chatLog(Color(200,200,200), "No entity data collected.")
+            end
+            
+            -- Chip usage statistics
+            table.sort(chipUsage, function(a, b) return a.usage > b.usage end)
+            
+            SFMA.chatLog(Color(255,150,100), "Chip Statistics", Color(255,255,255), " - Top 3 by CPU usage:")
+            
+            if #chipUsage > 0 then
+                for i = 1, math.min(3, #chipUsage) do
+                    local chip = chipUsage[i]
+                    local chipColor = chip.chipType == "SF" and Color(0,255,255) or Color(255,0,0)
+                    
+                    SFMA.chatLog(
+                        Color(255,200,100), "#" .. i, Color(255,255,255), " - ",
+                        chipColor, "[" .. chip.chipType .. "]", Color(255,255,255), " ",
+                        Color(255,255,200), chip.name, Color(255,255,255), " by ",
+                        getColor(chip.owner), chip.owner:getName(), Color(255,255,255), " - ",
+                        Color(255,100,100), chip.usage .. "us"
+                    )
+                end
+            else
+                SFMA.chatLog(Color(200,200,200), "No chips found.")
+            end
+            
+            -- Reset collision counts
+            collisionCounts = {}
+        end
+        
+        -- Incremental scanning function
+        local function scanBatch()
+            local endIndex = math.min(currentIndex + batchSize - 1, totalEnts)
+            
+            for i = currentIndex, endIndex do
+                local ent = allEnts[i]
+                
+                if not isValid(ent) then goto skip_ent end
+                
+                local owner = ent:getOwner()
+                if not isValid(owner) or not owner:isPlayer() then goto skip_ent end
+                
+                -- Get entity class
+                local entClass = ""
+                pcall(function() entClass = ent:getClass() end)
+                
+                -- Track chip usage (SF and E2) - count regardless of parenting
+                if entClass == "starfall_processor" or entClass == "gmod_wire_expression2" then
+                    local chipName = ""
+                    local quota = 0
+                    pcall(function() chipName = ent:getChipName() end)
+                    pcall(function() quota = ent:getQuotaAverage() end)
+                    quota = math.floor((quota or 0) * 1000000) -- Convert to microseconds
+                    
+                    if chipName == "" then chipName = "<no name>" end
+                    
+                    table.insert(chipUsage, {
+                        owner = owner,
+                        name = chipName,
+                        usage = quota,
+                        chipType = entClass == "starfall_processor" and "SF" or "E2"
+                    })
+                end
+                
+                -- Skip parented entities for scoring (except chips)
+                local isParented = false
+                pcall(function() isParented = isValid(ent:getParent()) end)
+                if isParented and entClass ~= "starfall_processor" and entClass ~= "gmod_wire_expression2" then
+                    goto skip_ent
+                end
+                
+                -- Track entity counts
+                if not playerEntityCounts[owner] then
+                    playerEntityCounts[owner] = { total = 0, props = 0 }
+                end
+                playerEntityCounts[owner].total = playerEntityCounts[owner].total + 1
+                
+                if entClass == "prop_physics" then
+                    playerEntityCounts[owner].props = playerEntityCounts[owner].props + 1
+                end
+                
+                -- Initialize player score
+                if not playerScores[owner] then
+                    playerScores[owner] = {
+                        score = 0,
+                        constraints = 0,
+                        heavyProps = 0,
+                        recentSpawns = 0,
+                        whiteProps = 0,
+                        velocitySpikes = 0,
+                        collisions = collisionCounts[owner] or 0
+                    }
+                end
+                
+                local pdata = playerScores[owner]
+                
+                -- Check if entity is physics-based
+                local phys = nil
+                pcall(function() phys = ent:getPhysicsObject() end)
+                
+                if phys and phys:isValid() then
+                    -- 1. Count constraints (skip if already counted for this player)
+                    if pdata.constraints < 1000 then  -- Cap to avoid excessive checks
+                        local constrained = {}
+                        pcall(function() constrained = ent:getAllConstrained() end)
+                        pdata.constraints = pdata.constraints + math.min(#constrained, 100)  -- Cap individual count
+                    end
+                    
+                    -- 2. Check for heavy props (>500kg)
+                    local mass = 0
+                    pcall(function() mass = phys:getMass() end)
+                    if mass > cfg.heavyPropMass then
+                        pdata.heavyProps = pdata.heavyProps + 1
+                    end
+                    
+                    -- 3. Check for recent spawns (last 5 seconds)
+                    local spawnTime = entitySpawnTimes[ent]
+                    if spawnTime and (now - spawnTime) < cfg.recentSpawnWindow then
+                        pdata.recentSpawns = pdata.recentSpawns + 1
+                    end
+                    
+                    -- 4. Check for white-colored props (lag indicator)
+                    local col = Color(0,0,0)
+                    pcall(function() col = ent:getColor() end)
+                    if col.r == 255 and col.g == 255 and col.b == 255 and col.a == 100 then
+                        pdata.whiteProps = pdata.whiteProps + 1
+                    end
+                    
+                    -- 5. Check velocity spikes
+                    local vel = Vector(0,0,0)
+                    pcall(function() vel = phys:getVelocity() end)
+                    local speed = vel:getLength()
+                    
+                    local lastSpeed = lastVelocities[ent] or 0
+                    local delta = math.abs(speed - lastSpeed)
+                    
+                    if delta > cfg.velocitySpikeThreshold then
+                        pdata.velocitySpikes = pdata.velocitySpikes + 1
+                    end
+                    
+                    lastVelocities[ent] = speed
+                end
+                
+                ::skip_ent::
+            end
+            
+            currentIndex = endIndex + 1
+            
+            -- If we've processed all entities, generate report
+            if currentIndex > totalEnts then
+                timer.remove("SFMA_scanBatch")
+                generateReport()
+            end
+        end
+        
+        -- Start incremental scanning (process batches every 0.05 seconds)
+        timer.create("SFMA_scanBatch", 0.05, 0, scanBatch)
+    end
+    
+    -- Start canary prop monitoring (lightweight check every 0.15s)
+    createCanaryProp()
+    timer.create("SFMA_canaryMonitor", SFMA.PhysicsLag.checkRate, 0, function()
+        if SFMA.PhysicsLag.enabled then
+            checkCanaryProp()
+        end
+    end)
+    
+    -- Cleanup canary on chip removal
+    hook.add("Removed", "SFMA_cleanupCanary", function()
+        if isValid(canaryProp) then
+            canaryProp:remove()
+        end
+    end)
+    
+    -- ============= END PHYSICS LAG DETECTION =============
 
     -- AFK Watch hook (server-side authoritative KeyPress)
     hook.add("KeyPress", "SFMA_AFKWatch", function( plr, key )
@@ -253,12 +719,17 @@ if SERVER then
         end
         lastKeyTime[plr] = now
 
-        -- Log only to owner (owner gets net message), and print console for server ops
-        SFMA.chatLog(getColor(plr), getName(plr), Color(255,255,255), " pressed ", Color(255,144,144), keyName, Color(255,255,255), "")
-        printConsole(Color(200,200,200), "[SFMA] detected keypress: ", Color(255,144,144), keyName, Color(200,200,200), " from ", getName(plr))
+        -- DO NOT spam chat anymore  only log to console and notify owner via HUD/net
+        printConsole(Color(255,0,0), "[SFMA] detected keypress: ", Color(255,144,144), keyName, Color(255,20,20), " from ", getName(plr))
 
-        -- send owner a notification + optional auto-spectate
-        --SFMA.logOffender(plr, false)
+        -- send owner a HUD notification (owner only)
+        pcall(function()
+            net.start("SFMA_notify")
+            net.writeEntity(plr)        -- who pressed
+            net.writeString(keyName)    -- which key
+            net.writeString("key")      -- type discriminator (future-use)
+            net.send(owner())
+        end)
 
         -- run hook for other modules if needed
         hook.run("SFMA_SuspiciousKeyPressed", plr, keyName)
@@ -272,9 +743,35 @@ if SERVER then
         local now = timer.curtime()
         if lastKeyTime[plr] and (now - lastKeyTime[plr]) < KEY_PRESS_COOLDOWN then return end
         lastKeyTime[plr] = now
-        SFMA.chatLog(getColor(plr), getName(plr), Color(255,255,255), " pressed (server-detected) ", Color(255,144,144), keyName, Color(255,255,255), "")
+
+        -- do not spam chat; still log + notify owner
+        printConsole(Color(200,200,200), "[SFMA] detected keypress (server): ", Color(255,144,144), keyName, Color(200,200,200), " from ", getName(plr))
         SFMA.logOffender(plr, true)
+
+        pcall(function()
+            net.start("SFMA_notify")
+            net.writeEntity(plr)
+            net.writeString(keyName)
+            net.writeString("key")
+            net.send(owner())
+        end)
+
         hook.run("SFMA_SuspiciousKeyPressed", plr, keyName)
+    end)
+
+
+    hook.add("PlayerSay", "", function(ply, text, isTeam, isLocal) // Player, string, bool, bool2
+        local name = nil
+        try(function()
+            name = ply:getName()
+        end)
+        
+        if isLocal then
+            if ply:getPos():getDistance(owner():getPos()) > 300 then
+                local teamColor = team.getColor(ply:getTeam())
+                print(Color(100,200,255), ' * * * * *(', teamColor, name, Color(250,255,255), ': ', text)
+            end
+        end
     end)
 
     -- ============= rest of server behavior (entity hooks, proppush, etc) =============
@@ -389,6 +886,7 @@ if SERVER then
                 propspamAlertCooldown[propOwner] = nil
             end)
         end
+
     end)
 
     local trackedProppushProps = {}
@@ -483,7 +981,7 @@ if CLIENT then
     -- This runs for all clients so server receives events from everyone
     hook.add("inputPressed", "SFMA_ClientNotifySpecialKey", function(key)
         if not suspiciousKeys[key] then return end
-        -- minimize spam: check local cooldown per client (optional)
+        -- minimize spam: local client cooldown (keeps client from spamming server)
         pcall(function()
             net.start("SFMA_keypress")
             net.writeInt(key, 16)
@@ -492,25 +990,40 @@ if CLIENT then
     end)
 
     -- Owner-only client features must be gated locally so other clients don't run them
+    -- Client-side lastOffender tracking (synced from server)
+    SFMA.lastOffender = nil
+    
     net.receive("SFMA_logOffender", function()
         local offender = net.readEntity()
         local ping = net.readBool()
-        -- Only the owner receives this net message (server sends to owner())
-        if not isValid(player()) or player() ~= owner() then return end
-        -- play attention sound for owner
+        
+        -- Update client-side lastOffender for spectate key
+        SFMA.lastOffender = offender
+        
+        -- Clear after 30 seconds (same as server)
+        timer.remove("SFMA_clearLastOffender_client")
+        timer.create("SFMA_clearLastOffender_client", 30, 1, function()
+            SFMA.lastOffender = nil
+        end)
+        
+        -- play attention sound for owner (same sound as before)
         if ping then
             player():emitSound("npc/metropolice/vo/on1.wav")
         end
-        -- optionally show a small HUD notification here (owner only)
+        -- show HUD notification for logged offender
+        local name = "<unknown>"
+        if isValid(offender) and offender.getName then name = offender:getName() end
+        local txt = name .. " logged"
+        SFMA_HUD_Add( offender, txt, SFMA.HUD.defaultDuration )
     end)
 
     -- quick spectate (owner-only on client)
     local lastSpectateBindPress = 0
     hook.add("inputPressed", "SFMA_quickSpectate", function( key )
         -- only owner can use quick-spectate bind locally
-        if not isValid(player()) or player() ~= owner() then return end
+        if player() ~= owner() then return end
         if input.getKeyName(key) ~= SFMA.SpectateKey then return end
-        if not SFMA.lastOffender then
+        if not SFMA.lastOffender or not isValid(SFMA.lastOffender) then
             return SFMA.chatLog("There is no recent offender to spectate!")
         end
         if owner():isPVP() and timer.curtime() - lastSpectateBindPress > 0.35 then
@@ -520,6 +1033,216 @@ if CLIENT then
         SFMA.chatLog("Spectating ", getColor(SFMA.lastOffender), getName(SFMA.lastOffender), Color(255,255,255), ".")
         concmd("fspectate \"" .. SFMA.lastOffender:getSteamID() .. "\"")
     end)
+
+    -- ----------------- HUD notification system (owner only) -----------------
+    -- Notifications: { text = string, color = Color, t = startTime, dur = number }
+    local Notifications = {}
+    local hudFont = nil
+
+    -- create font once
+    local function ensureFont()
+        if hudFont then return end
+        hudFont = render.createFont("Arial", 16, 800, true)
+    end
+
+    -- Add HUD notification helper (owner-only visual)
+    function SFMA_HUD_Add( entityOrPlayer, message, duration )
+        -- server sends only to owner, so client-side owner() check is not required and could block
+        ensureFont()
+        local col = Color(255,255,255)
+        if isValid(entityOrPlayer) and entityOrPlayer.isPlayer and entityOrPlayer:isPlayer() then
+            col = team.getColor(entityOrPlayer:getTeam()) or col
+        end
+        duration = duration or SFMA.HUD.defaultDuration
+        table.insert(Notifications, 1, { text = message, color = col, t = timer.curtime(), dur = duration })
+        while #Notifications > SFMA.HUD.maxMessages do table.remove(Notifications) end
+    end
+
+    -- Net receive: generic notify (used for suspicious key pressing)
+    net.receive("SFMA_notify", function()
+        -- accept the net; server already sends only to owner(), client-side strict owner() check was blocking notifications
+        local who = net.readEntity()
+        local payload = net.readString()
+        local msgtype = net.readString() -- currently "key" for keypress
+        if not payload then return end
+
+        local name = "<unknown>"
+        if isValid(who) and who.getName then name = who:getName() end
+
+        if msgtype == "key" then
+            local text = name .. " pressed " .. payload
+            SFMA_HUD_Add(who, text, SFMA.HUD.defaultDuration)
+            -- use same attention sound as logOffender
+            --player():emitSound("npc/metropolice/vo/on1.wav")
+        else
+            SFMA_HUD_Add(who, name .. " " .. payload, SFMA.HUD.defaultDuration)
+        end
+    end)
+
+    -- Draw HUD: left-middle stack, fading, newest on top
+    hook.add("drawhud", "SFMA_HUD_Draw", function()
+        --ensureFont()
+        local now = timer.curtime()
+        local lh = SFMA.HUD.lineHeight
+
+        -- get screen resolution (works in your other chip)
+        local screenW, screenH = render.getGameResolution()
+
+        -- remove expired messages (iterate from back to front)
+        for i = #Notifications, 1, -1 do
+            local n = Notifications[i]
+            if not n then
+                table.remove(Notifications, i)
+            else
+                local elapsed = now - n.t
+                if elapsed >= n.dur then
+                    table.remove(Notifications, i)
+                end
+            end
+        end
+
+        local num = math.min(#Notifications, SFMA.HUD.maxMessages)
+        if num == 0 then return end
+
+        -- compute vertical centered start Y (middle of left side)
+        local totalHeight = num * lh
+        local startY = math.floor(screenH * 0.5 - totalHeight * 0.5)
+
+        local x = SFMA.HUD.x
+        local bgw = SFMA.HUD.bgWidth
+
+        -- draw from newest (index 1) downward
+        for i = 1, num do
+            local n = Notifications[i]
+            if not n then break end
+            local elapsed = now - n.t
+            local alpha = math.floor(255 * (1 - (elapsed / n.dur)))
+            if alpha < 0 then alpha = 0 end
+            local col = Color(n.color.r, n.color.g, n.color.b, alpha)
+            local y = startY + (i-1) * lh
+
+            render.setFont(hudFont)
+            -- background rect for readability (slightly translucent black)
+            render.setColor(Color(0,0,0, math.floor(alpha * 0.6)))
+            render.drawRect(x - 6, y - 2, bgw, SFMA.HUD.bgHeight)
+            -- text (left aligned)
+            render.setColor(col)
+            render.drawText(x, y + 2, n.text, 0)
+        end
+    end)
+    -- ----------------- END HUD system -----------------
+    
+    -- ============= IMPACT DEBUG SYSTEM =============
+    if player() == owner() then
+        local impactMarkers = {} -- {pos, time, isHit, startPos}
+        local nearbyEntities = {} -- Cache nearby entities for hitbox rendering
+        local lastWeaponFire = 0
+        local lastHitboxUpdate = 0
+        
+        print(Color(0,255,255), "[Impact Debug] ", Color(255,255,255), "System initialized for owner")
+        
+        -- Update nearby entities for hitbox rendering
+        local function updateNearbyEntities()
+            if not SFMA.ImpactDebug.enabled then 
+                nearbyEntities = {}
+                return 
+            end
+            if not isValid(owner()) then return end
+            
+            local ownerPos = owner():getPos()
+            nearbyEntities = find.inSphere(ownerPos, SFMA.ImpactDebug.hitboxRadius)
+            print(Color(0,255,255), "[Impact Debug] ", Color(255,255,255), "Found " .. #nearbyEntities .. " nearby entities")
+        end
+        
+        -- Hook weapon firing using InputPressed
+        hook.add("InputPressed", "SFMA_ImpactDebug", function(button)
+            if not SFMA.ImpactDebug.enabled then return end
+            
+            print(Color(0,255,255), "[Impact Debug] ", Color(255,255,255), "Button pressed: " .. tostring(button))
+            
+            -- Check if it's left mouse button (MOUSE.LEFT = 107)
+            if button ~= MOUSE.LEFT and button ~= MOUSE.RIGHT then return end
+            
+            local now = timer.curtime()
+            if now - lastWeaponFire < 0.05 then return end -- Debounce
+            lastWeaponFire = now
+            
+            print(Color(0,255,255), "[Impact Debug] ", Color(255,255,255), "Mouse click detected!")
+            
+            -- Perform trace from eye position
+            local eyePos = owner():getEyePos()
+            local eyeAng = owner():getEyeAngles()
+            local endPos = eyePos + eyeAng:getForward() * 50000
+            local tr = trace.line(eyePos, endPos, owner())
+            
+            print(Color(0,255,255), "[Impact Debug] ", Color(255,255,255), "Trace Hit: " .. tostring(tr.Hit) .. " at " .. tostring(tr.HitPos))
+            
+            if tr.Hit then
+                table.insert(impactMarkers, {
+                    pos = tr.HitPos,
+                    time = now,
+                    isHit = isValid(tr.Entity),
+                    startPos = eyePos
+                })
+                
+                print(Color(0,255,255), "[Impact Debug] ", Color(255,255,255), "Impact marker added! Total: " .. #impactMarkers)
+            end
+        end)
+        
+        -- Update nearby entities periodically
+        hook.add("think", "SFMA_UpdateNearbyEnts", function()
+            if not SFMA.ImpactDebug.enabled then return end
+            
+            local now = timer.curtime()
+            if now - lastHitboxUpdate > 0.5 then
+                lastHitboxUpdate = now
+                updateNearbyEntities()
+            end
+        end)
+        
+        -- Render hitboxes and impact markers
+        hook.add("postdrawopaquerenderables", "SFMA_DrawImpacts", function()
+            if not SFMA.ImpactDebug.enabled then return end
+            
+            local now = timer.curtime()
+            local cfg = SFMA.ImpactDebug
+            
+            -- Draw impact markers and bullet traces
+            for i = #impactMarkers, 1, -1 do
+                local impact = impactMarkers[i]
+                local age = now - impact.time
+                
+                if age > cfg.impactLifetime then
+                    table.remove(impactMarkers, i)
+                else
+                    local alpha = math.floor(255 * (1 - age / cfg.impactLifetime))
+                    
+                    -- Draw bullet trace line (green)
+                    render.setColor(Color(cfg.bulletTraceColor.r, cfg.bulletTraceColor.g, cfg.bulletTraceColor.b, alpha))
+                    render.draw3DLine(impact.startPos, impact.pos, true)
+                    
+                    -- Draw impact point as wireframe box
+                    local impactColor = impact.isHit and cfg.hitImpactColor or cfg.missImpactColor
+                    render.setColor(Color(impactColor.r, impactColor.g, impactColor.b, alpha))
+                    render.draw3DWireframeBox(impact.pos, Angle(0,0,0), Vector(-3,-3,-3), Vector(3,3,3), true)
+                end
+            end
+            
+            -- Draw OBB hitboxes for nearby entities (like sfmdv5)
+            for _, ent in ipairs(nearbyEntities) do
+                if not isValid(ent) then continue end
+                if ent == owner() then continue end
+                
+                local mins, maxs = ent:obbMins(), ent:obbMaxs()
+                
+                render.setColor(Color(0, 255, 0, 100))
+                render.draw3DWireframeBox(ent:getPos(), ent:getAngles(), mins, maxs, true)
+            end
+        end)
+        
+        enableHud(owner(), true)
+    end
+    -- ============= END IMPACT DEBUG SYSTEM =============
 end -- CLIENT
 
 return SFMA

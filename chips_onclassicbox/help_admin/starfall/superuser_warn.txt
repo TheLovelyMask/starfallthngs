@@ -1,0 +1,386 @@
+--@name Superuser Warn System
+--@author thelovelymask
+--@shared
+--@superuser
+
+-- SUPERUSER owner override
+function owner() return chip():getOwner() end
+
+--[[ CONFIG ]]--
+local WARN_DURATION = 20 -- seconds
+local WARN_SOUND_URL = "https://www.myinstants.com/media/sounds/ford-warning-door-chime.mp3"
+local WARN_IMAGE_URL = "https://i.imgur.com/O0rUsf5.png"
+local TELEPORT_INTERVAL = 0.5 -- seconds between teleports
+local REMOVE_ENTITIES_RULES = {"1.4", "1.5"} -- Rules that trigger entity removal
+local REMOVE_ENTITIES_ENABLED = true -- Toggle for entity removal feature
+
+--[[ HELPER FUNCTIONS ]]--
+local function getColor(plr)
+    return team.getColor(plr:getTeam())
+end
+
+local function getName(plr)
+    return "<" .. plr:getSteamID() .. "> " .. plr:getName()
+end
+
+local function chatLog(...)
+    print(Color(231, 55, 62), "[WARN] ", Color(255,255,255), ...)
+end
+
+--[[ SERVER LOGIC ]]--
+if SERVER then
+        
+    local activeWarns = {} -- [player] = {startTime, frozenPos, reason}
+    
+    -- Freeze player in place
+    local function freezePlayer(ply)
+        if not isValid(ply) then return end
+        if not activeWarns[ply] then return end
+        
+        local frozenPos = activeWarns[ply].frozenPos
+        if frozenPos then
+            ply:setPos(frozenPos)
+        end
+    end
+    
+    -- Remove all entities owned by player
+    local function removePlayerEntities(ply)
+        if not isValid(ply) then return end
+        
+        local removed = 0
+        for _, ent in ipairs(find.all()) do
+            if isValid(ent) and ent:getOwner() == ply then
+                ent:remove()
+                removed = removed + 1
+            end
+        end
+        
+        chatLog("Removed ", Color(255,100,100), removed, Color(255,255,255), " entities from ", getColor(ply), getName(ply))
+    end
+    
+    -- Start warn for player
+    local function warnPlayer(target, reason, removeEnts)
+        if not isValid(target) then return end
+        
+        local now = timer.curtime()
+        
+        -- Store warn data
+        activeWarns[target] = {
+            startTime = now,
+            frozenPos = target:getPos(),
+            reason = reason
+        }
+        
+        -- Strip weapons
+        target:stripWeapons()
+        
+        -- Remove entities if needed
+        if removeEnts and REMOVE_ENTITIES_ENABLED then
+            removePlayerEntities(target)
+        end
+        
+        -- Create warning prop at player position (40 units higher)
+        local warnPos = target:getPos() + Vector(0, 0, 40)
+        local warnProp = prop.create(warnPos, Angle(0,0,0), "models/hunter/blocks/cube2x2x2.mdl", true)
+        
+        if isValid(warnProp) then
+            warnProp:setMaterial("models/wireframe")
+            -- Physics enabled (no collision group change)
+            
+            -- Flicker animation
+            local flickerTime = 0
+            timer.create("WarnFlicker_" .. target:getSteamID(), 0.1, math.floor(WARN_DURATION / 0.1), function()
+                if not isValid(warnProp) then return end
+                
+                flickerTime = flickerTime + 0.1
+                local t = flickerTime % 1
+                
+                -- Interpolate between red and white
+                local r = 255
+                local g = math.floor(255 * t)
+                local b = math.floor(255 * t)
+                
+                warnProp:setColor(Color(r, g, b))
+            end)
+            
+            -- Remove prop after duration
+            timer.simple(WARN_DURATION, function()
+                if isValid(warnProp) then
+                    warnProp:remove()
+                end
+            end)
+        end
+        
+        -- Send to client
+        pcall(function()
+            net.start("WarnSystem_Start")
+            net.writeString(reason)
+            net.writeFloat(WARN_DURATION)
+            
+            net.writeString(target:getSteamID())
+            net.writeString(target:getName())
+            
+            net.send(target)
+        end)
+        
+        -- Send sound trigger to client
+        pcall(function()
+            net.start("WarnSystem_PlaySound")
+            net.writeVector(target:getPos())
+            net.send(target)
+        end)
+        
+        -- Freeze player periodically
+        timer.create("WarnFreeze_" .. target:getSteamID(), TELEPORT_INTERVAL, math.floor(WARN_DURATION / TELEPORT_INTERVAL), function()
+            freezePlayer(target)
+        end)
+        
+        -- End warn after duration
+        timer.simple(WARN_DURATION, function()
+            if not isValid(target) then return end
+            if not activeWarns[target] then return end
+            
+            activeWarns[target] = nil
+            
+            -- Kill player
+            target:kill()
+            
+            -- Notify client to end
+            pcall(function()
+                net.start("WarnSystem_End")
+                net.send(target)
+            end)
+            
+            chatLog(getColor(target), getName(target), Color(255,255,255), " warn ended.")
+        end)
+        
+        print("Warned ", getColor(target), getName(target), Color(255,255,255), " for rule ", Color(255,200,100), reason)
+    end
+    
+    -- Parse player from string (name or steamid)
+    local function findPlayer(str)
+        if not str then return nil end
+        
+        -- Try by name first
+        for _, ply in ipairs(find.allPlayers()) do
+            if ply:getName():lower():find(str:lower(), 1, true) then
+                return ply
+            end
+        end
+        
+        -- Try by steamid
+        for _, ply in ipairs(find.allPlayers()) do
+            if ply:getSteamID() == str then
+                return ply
+            end
+        end
+        
+        return nil
+    end
+    
+    -- Parse chat command
+    hook.add("PlayerSay", "WarnSystem_Command", function(ply, text)
+        -- Check if it's a warn command
+        local cmd = text:lower():match("^!(%w+)")
+        if cmd ~= "warn" and cmd ~= "w" then return end
+        
+        -- Only owner can use
+        if ply ~= owner() then 
+            chatLog(Color(255,100,100), "Unauthorized warn attempt by ", getColor(ply), getName(ply))
+            return ""
+        end
+        
+        -- Parse arguments: !warn PlayerName Reason
+        local args = {}
+        for word in text:gmatch("%S+") do
+            table.insert(args, word)
+        end
+        
+        -- Need at least 3 args: !warn player reason
+        if #args < 3 then
+            chatLog(Color(255,100,100), "Usage: !warn <player> <reason>")
+            return ""
+        end
+        
+        local playerName = args[2]
+        local reason = args[3]
+        
+        -- Find target player
+        local target = findPlayer(playerName)
+        if not isValid(target) then
+            chatLog(Color(255,100,100), "Player '", playerName, "' not found!")
+            return ""
+        end
+        
+        -- Check if reason triggers entity removal
+        local shouldRemove = false
+        for _, rule in ipairs(REMOVE_ENTITIES_RULES) do
+            if reason:find(rule) then
+                shouldRemove = true
+                break
+            end
+        end
+        
+        -- Execute warn
+        warnPlayer(target, reason, shouldRemove)
+        
+        return "" -- Hide command from chat
+    end)
+end
+
+--[[ CLIENT LOGIC ]]--
+if CLIENT then
+    local warnActive = false
+    local warnReason = ""
+    local warnEndTime = 0
+    local warnMaterial = nil
+    local warnFont = nil
+    
+    -- Initialize font
+    local function ensureFont()
+        if warnFont then return end
+        warnFont = render.createFont("Impact", 48, 800, true)
+    end
+    
+    -- Start warn screen
+    net.receive("WarnSystem_Start", function()
+        warnReason = net.readString()
+        local duration = net.readFloat()
+        
+        local targetSteamID = net.readString()
+        local targetName = net.readString()
+        
+        warnActive = true
+        warnEndTime = timer.curtime() + duration
+        
+        ensureFont()
+        
+        --print(Color(255,255,0), "[Warn] ", Color(255,255,255), "Loading image: " .. WARN_IMAGE_URL)
+        
+        -- Create material from URL using render.createMaterial
+        warnMaterial = nil -- Force reload
+        render.createMaterial(WARN_IMAGE_URL, function(mat, url, w, h)
+            if mat then
+                warnMaterial = mat
+                --print(Color(0,255,0), "[Warn] ", Color(255,255,255), "Image loaded! Size: " .. w .. "x" .. h)
+            else
+                --print(Color(255,100,100), "[Warn] Failed to load image")
+            end
+        end)
+
+        print(
+            Color(255,100,100), "[Warn] ",
+            Color(255,255,255),
+            "<" .. targetSteamID .. "> " .. targetName,
+            " have been warned for rule ",
+            warnReason
+        )
+    end)
+    
+    -- End warn screen
+    net.receive("WarnSystem_End", function()
+        warnActive = false
+        warnMaterial = nil
+        --print(Color(0,255,0), "[Warn] ", Color(255,255,255), "Warn ended")
+    end)
+    
+    -- Play sound on client
+    net.receive("WarnSystem_PlaySound", function()
+        local soundPos = net.readVector()
+        
+        --print(Color(255,255,0), "[Warn] ", Color(255,255,255), "Loading sound...")
+        
+        bass.loadURL(WARN_SOUND_URL, "3d noblock", function(sound, errID, errName)
+            if sound then
+                --print(Color(0,255,0), "[Warn] ", Color(255,255,255), "Sound loaded!")
+                sound:setPos(soundPos)
+                sound:setVolume(1)
+                sound:setLooping(false)
+                sound:play()
+                
+                -- Auto-cleanup when sound finishes
+                timer.simple(WARN_DURATION + 1, function()
+                    if sound and sound:isValid() then
+                        sound:stop()
+                    end
+                end)
+            else
+                --print(Color(255,100,100), "[Warn] Failed to load sound: ", errName)
+            end
+        end)
+    end)
+    
+    -- Render warn screen
+    hook.add("drawhud", "WarnSystem_DrawScreen", function()
+        if not warnActive then return end
+        
+        -- Check if time expired
+        if timer.curtime() >= warnEndTime then
+            warnActive = false
+            warnMaterial = nil
+            return
+        end
+        
+        local screenW, screenH = render.getResolution()
+        
+        if not warnMaterial then return end
+        
+        local screenW, screenH = render.getResolution()
+        
+        --viewport
+        render.setViewPort(0, 0, screenW, screenH)
+        
+        render.setMaterial(warnMaterial)
+        render.setColor(Color(255,255,255,255))
+        
+        local imgW = warnMaterial:getWidth()
+        local imgH = warnMaterial:getHeight()
+        
+        -- FIT scaling
+        local scale = math.min(screenW / imgW, screenH / imgH)
+        
+        local drawW = imgW * scale
+        local drawH = imgH * scale
+        
+        local x = (screenW - drawW) * 0.5
+        local y = (screenH - drawH) * 0.5
+        
+        render.drawTexturedRect(x, y, drawW, drawH)
+
+        -- Draw reason text at bottom-center
+        render.setFont(warnFont)
+        
+        local reasonText = warnReason
+        local textW, textH = render.getTextSize(reasonText)
+        
+        -- Position at bottom-center (leaving space for image design)
+        local textX = screenW / 2 - textW / 2
+        local textY = screenH - 150 -- 150px from bottom
+        
+        -- Draw shadow
+        render.setColor(Color(0, 0, 0, 255))
+        render.drawText(textX + 2, textY + 2, reasonText, 0)
+        
+        -- Draw text
+        render.setColor(Color(255, 50, 50, 255))
+        render.drawText(textX, textY, reasonText, 0)
+        
+        -- Draw time remaining
+        local timeLeft = math.ceil(warnEndTime - timer.curtime())
+        if timeLeft > 0 then
+            local timeText = "OCTALOCb: " .. timeLeft .. "CEK"
+            local timeW, timeH = render.getTextSize(timeText)
+            
+            render.setFont(warnFont)
+            render.setColor(Color(255, 255, 255, 200))
+            render.drawText(screenW / 2 - timeW / 2, 50, timeText, 0)
+        end
+    end)
+    
+    -- Block input during warn (optional)
+    hook.add("inputPressed", "WarnSystem_BlockInput", function(key)
+        if warnActive then
+            return true -- Block all input
+        end
+    end)
+end
