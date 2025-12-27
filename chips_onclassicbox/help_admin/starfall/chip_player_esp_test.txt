@@ -5,6 +5,7 @@
 local chipsESPEnabled = false
 local playersESPEnabled = false
 local impactDebugEnabled = false
+local chamsEnabled = false
 
 if SERVER then
     -- Chat commands
@@ -19,6 +20,7 @@ if SERVER then
             net.writeBool(chipsESPEnabled)
             net.writeBool(playersESPEnabled)
             net.writeBool(impactDebugEnabled)
+            net.writeBool(chamsEnabled)
             net.send(owner())
             
             return ""
@@ -32,6 +34,7 @@ if SERVER then
             net.writeBool(chipsESPEnabled)
             net.writeBool(playersESPEnabled)
             net.writeBool(impactDebugEnabled)
+            net.writeBool(chamsEnabled)
             net.send(owner())
             
             return ""
@@ -45,6 +48,21 @@ if SERVER then
             net.writeBool(chipsESPEnabled)
             net.writeBool(playersESPEnabled)
             net.writeBool(impactDebugEnabled)
+            net.writeBool(chamsEnabled)
+            net.send(owner())
+            
+            return ""
+        end
+        
+        if text == "!chams" then
+            chamsEnabled = not chamsEnabled
+            print(Color(0,255,255), "[ESP] ", Color(255,255,255), "Chams is now ", chamsEnabled and "enabled" or "disabled")
+            
+            net.start("ESP_SyncState")
+            net.writeBool(chipsESPEnabled)
+            net.writeBool(playersESPEnabled)
+            net.writeBool(impactDebugEnabled)
+            net.writeBool(chamsEnabled)
             net.send(owner())
             
             return ""
@@ -138,7 +156,6 @@ if SERVER then
         if not playersESPEnabled then return end
         
         local playerData = {}
-        local allEnts = find.all()
         
         for _, ply in pairs(find.allPlayers()) do
             if isValid(ply) and ply ~= owner() then
@@ -150,15 +167,14 @@ if SERVER then
                     mode = "BUILD"
                 end
                 
-                -- Count entities
+                -- Count entities by owner (more reliable on server)
                 local entCount = 0
-                local maxChecks = 200
-                local checked = 0
-                for _, ent in pairs(allEnts) do
-                    if checked >= maxChecks then break end
-                    checked = checked + 1
-                    if isValid(ent) and isValid(ent:getOwner()) and ent:getOwner() == ply then
-                        entCount = entCount + 1
+                for _, ent in pairs(find.all()) do
+                    if isValid(ent) then
+                        local entOwner = ent:getOwner()
+                        if isValid(entOwner) and entOwner == ply then
+                            entCount = entCount + 1
+                        end
                     end
                 end
                 
@@ -188,6 +204,66 @@ end
 
 if CLIENT then
     
+    -- Get color based on CPU usage (green to red gradient)
+    local function getCPUColor(usage)
+        if usage <= 500 then return Color(0, 255, 0) end -- Green for low usage
+        if usage >= 2000 then return Color(255, 0, 0) end -- Red for high usage
+        
+        local ratio = (usage - 500) / 1500
+        local r = math.floor(255 * ratio)
+        local g = math.floor(255 * (1 - ratio))
+        return Color(r, g, 0)
+    end
+    
+    -- Draw corner brackets around text
+    local function drawCornerBrackets(x, y, w, h, color, thickness)
+        local cornerSize = 8
+        thickness = thickness or 2
+        
+        render.setColor(color)
+        
+        -- Top-left corner
+        render.drawRectFast(x, y, cornerSize, thickness)
+        render.drawRectFast(x, y, thickness, cornerSize)
+        
+        -- Top-right corner
+        render.drawRectFast(x + w - cornerSize, y, cornerSize, thickness)
+        render.drawRectFast(x + w - thickness, y, thickness, cornerSize)
+        
+        -- Bottom-left corner
+        render.drawRectFast(x, y + h - thickness, cornerSize, thickness)
+        render.drawRectFast(x, y + h - cornerSize, thickness, cornerSize)
+        
+        -- Bottom-right corner
+        render.drawRectFast(x + w - cornerSize, y + h - thickness, cornerSize, thickness)
+        render.drawRectFast(x + w - thickness, y + h - cornerSize, thickness, cornerSize)
+    end
+    
+    -- Get gradient color for entity count (green to red)
+    local function getEntityCountColor(count)
+        if count <= 0 then return Color(0, 255, 0) end
+        if count >= 200 then return Color(255, 0, 0) end
+        
+        local ratio = count / 200
+        local r = math.floor(255 * ratio)
+        local g = math.floor(255 * (1 - ratio))
+        return Color(r, g, 0)
+    end
+    
+    -- Get gradient color for hours (red -> yellow -> green)
+    local function getHoursColor(hours)
+        if hours <= 0 then return Color(255, 0, 0) end
+        if hours >= 300 then return Color(0, 255, 0) end
+        
+        if hours <= 100 then
+            local ratio = hours / 100
+            return Color(255, math.floor(255 * ratio), 0)
+        else
+            local ratio = (hours - 100) / 200
+            return Color(math.floor(255 * (1 - ratio)), 255, 0)
+        end
+    end    
+    
     -- Only run for owner
     if player() ~= owner() then return end
     
@@ -196,6 +272,7 @@ if CLIENT then
         chipsESPEnabled = net.readBool()
         playersESPEnabled = net.readBool()
         impactDebugEnabled = net.readBool()
+        chamsEnabled = net.readBool()
     end)
     
     -- Create fonts
@@ -207,6 +284,9 @@ if CLIENT then
     local cachedChips = {}
     local cachedPlayers = {}
     local cachedWhiteProps = {}
+    
+    -- Random colors for chams (persistent per player)
+    local playerChamsColors = {}
     
     -- Receive chip data from server
     net.receive("ESP_ChipData", function()
@@ -271,66 +351,6 @@ if CLIENT then
             end
         end
     end)
-    
-    -- Get color based on CPU usage (green to red gradient)
-    local function getCPUColor(usage)
-        if usage <= 500 then return Color(0, 255, 0) end -- Green for low usage
-        if usage >= 2000 then return Color(255, 0, 0) end -- Red for high usage
-        
-        local ratio = (usage - 500) / 1500
-        local r = math.floor(255 * ratio)
-        local g = math.floor(255 * (1 - ratio))
-        return Color(r, g, 0)
-    end
-    
-    -- Draw corner brackets around text
-    local function drawCornerBrackets(x, y, w, h, color, thickness)
-        local cornerSize = 8
-        thickness = thickness or 2
-        
-        render.setColor(color)
-        
-        -- Top-left corner
-        render.drawRectFast(x, y, cornerSize, thickness)
-        render.drawRectFast(x, y, thickness, cornerSize)
-        
-        -- Top-right corner
-        render.drawRectFast(x + w - cornerSize, y, cornerSize, thickness)
-        render.drawRectFast(x + w - thickness, y, thickness, cornerSize)
-        
-        -- Bottom-left corner
-        render.drawRectFast(x, y + h - thickness, cornerSize, thickness)
-        render.drawRectFast(x, y + h - cornerSize, thickness, cornerSize)
-        
-        -- Bottom-right corner
-        render.drawRectFast(x + w - cornerSize, y + h - thickness, cornerSize, thickness)
-        render.drawRectFast(x + w - thickness, y + h - cornerSize, thickness, cornerSize)
-    end
-    
-    -- Get gradient color for entity count (green to red)
-    local function getEntityCountColor(count)
-        if count <= 0 then return Color(0, 255, 0) end
-        if count >= 200 then return Color(255, 0, 0) end
-        
-        local ratio = count / 200
-        local r = math.floor(255 * ratio)
-        local g = math.floor(255 * (1 - ratio))
-        return Color(r, g, 0)
-    end
-    
-    -- Get gradient color for hours (red -> yellow -> green)
-    local function getHoursColor(hours)
-        if hours <= 0 then return Color(255, 0, 0) end
-        if hours >= 300 then return Color(0, 255, 0) end
-        
-        if hours <= 100 then
-            local ratio = hours / 100
-            return Color(255, math.floor(255 * ratio), 0)
-        else
-            local ratio = (hours - 100) / 200
-            return Color(math.floor(255 * (1 - ratio)), 255, 0)
-        end
-    end
     
     -- ============= CHIPS ESP =============
     
@@ -448,47 +468,145 @@ if CLIENT then
     hook.add("drawhud", "DrawPlayersInfo", function()
         if not playersESPEnabled then return end
         if cpuTotalAverage() > cpuMax() * 0.8 then return end
+        
+        local ownerPos = owner():getPos()
+        local maxDistance = 5000
+        
         for _, data in ipairs(cachedPlayers) do
             if not isValid(data.ply) then continue end
             
             local pos = data.ply:getPos():toScreen()
             if not pos.visible then continue end
             
-            -- Dynamic background size
+            -- Calculate distance for aggressive scaling
+            local distance = data.ply:getPos():getDistance(ownerPos)
+            if distance > maxDistance then continue end
+            
+            -- More aggressive scale curve (0.3 to 1.0)
+            local distRatio = distance / maxDistance
+            local scale = math.max(0.3, 1 - distRatio * 0.7)
+            
+            -- Dynamic text measurements
+            render.setFont(playerFont)
             local nameWidth = render.getTextSize(data.name)
-            local bgWidth = math.max(nameWidth + 40, 150)
-            local bgHeight = 60
+            render.setFont(smallFont)
+            local modeWidth = render.getTextSize(data.mode)
+            local entWidth = render.getTextSize("E:" .. data.entCount)
+            local hoursWidth = render.getTextSize(data.hoursPlayed .. "h")
+            
+            -- Calculate proper background size with padding
+            local maxTextWidth = math.max(nameWidth, modeWidth, entWidth + hoursWidth + 70)
+            local bgWidth = (maxTextWidth + 50) * scale
+            local bgHeight = 65 * scale
             local bgX = pos.x - bgWidth/2
-            local bgY = pos.y - 15
+            local bgY = pos.y - 18 * scale
             
             -- Semi-transparent background
             render.setColor(Color(0, 0, 0, 200))
             render.drawRectFast(bgX, bgY, bgWidth, bgHeight)
             
-            -- Corner brackets (green for low ent count, red for high)
+            -- Corner brackets
             local cornerColor = data.entColor
-            drawCornerBrackets(bgX, bgY, bgWidth, bgHeight, cornerColor, 2)
+            drawCornerBrackets(bgX, bgY, bgWidth, bgHeight, cornerColor, math.max(1, 2 * scale))
             
             -- Player name
             render.setFont(playerFont)
             render.setColor(data.nameColor)
-            render.drawText(pos.x, pos.y - 10, data.name, 1)
+            render.drawSimpleText(pos.x, pos.y - 12 * scale, data.name, 1, 1, scale)
             
             -- Mode
             render.setFont(smallFont)
             render.setColor(data.modeColor)
-            render.drawText(pos.x, pos.y + 8, data.mode, 1)
+            render.drawSimpleText(pos.x, pos.y + 6 * scale, data.mode, 1, 1, scale * 0.85)
             
             -- Entity count (left)
             render.setColor(data.entColor)
-            render.drawText(pos.x - 35, pos.y + 26, "E:" .. data.entCount, 1)
+            render.drawSimpleText(pos.x - 38 * scale, pos.y + 24 * scale, "E:" .. data.entCount, 1, 1, scale * 0.8)
             
             -- Hours (right)
             render.setColor(data.hoursColor)
-            render.drawText(pos.x + 20, pos.y + 26, data.hoursPlayed .. "h", 1)
+            render.drawSimpleText(pos.x + 25 * scale, pos.y + 24 * scale, data.hoursPlayed .. "h", 1, 1, scale * 0.8)
         end
     end)
     -- ============= END PLAYERS ESP SYSTEM =============
+    
+    -- ============= CHAMS SYSTEM =============
+    -- Generate random color for player
+    local function getPlayerChamsColor(ply)
+        if not playerChamsColors[ply] then
+            -- Generate bright random color
+            playerChamsColors[ply] = Color(
+                math.random(100, 255),
+                math.random(100, 255),
+                math.random(100, 255)
+            )
+        end
+        return playerChamsColors[ply]
+    end
+    
+    -- Store original materials
+    local originalMaterials = {}
+    local originalColors = {}
+    
+    -- Create flat material
+    local chamsMat = material.create("UnlitGeneric")
+    chamsMat:setInt("$flags", 256) -- Ignore Z
+    
+    -- Apply/remove chams materials
+    hook.add("think", "ChamsApply", function()
+        if not chamsEnabled then
+            -- Restore originals
+            for ply, mat in pairs(originalMaterials) do
+                if isValid(ply) then
+                    ply:setMaterial(mat)
+                    if originalColors[ply] then
+                        ply:setColor(originalColors[ply])
+                    end
+                end
+            end
+            originalMaterials = {}
+            originalColors = {}
+            return
+        end
+        if cpuTotalAverage() > cpuMax() * 0.9 then return end
+        
+        for _, ply in ipairs(find.allPlayers()) do
+            if not isValid(ply) then continue end
+            if ply == owner() then continue end
+            
+            -- Store original once
+            if not originalMaterials[ply] then
+                originalMaterials[ply] = ply:getMaterial()
+                originalColors[ply] = ply:getColor()
+            end
+            
+            local chamsColor = getPlayerChamsColor(ply)
+            
+            -- Apply color and flat material (will render through walls due to $flags)
+            ply:setColor(chamsColor)
+            ply:setMaterial("!chams_" .. ply:entIndex())
+        end
+    end)
+    
+    -- Custom render for chams with proper depth
+    hook.add("postdrawentities", "ChamsRenderCustom", function()
+        if not chamsEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.9 then return end
+        
+        -- Set ignorez material
+        render.setMaterial(chamsMat)
+        
+        for _, ply in ipairs(find.allPlayers()) do
+            if not isValid(ply) then continue end
+            if ply == owner() then continue end
+            
+            local chamsColor = getPlayerChamsColor(ply)
+            render.setColorModulation(chamsColor.r / 255, chamsColor.g / 255, chamsColor.b / 255)
+        end
+        
+        render.setColorModulation(1, 1, 1)
+    end)
+    -- ============= END CHAMS SYSTEM =============
     
     -- ============= IMPACT DEBUG SYSTEM =============
     local impactMarkers = {} -- {pos, time, isHit, startPos}
