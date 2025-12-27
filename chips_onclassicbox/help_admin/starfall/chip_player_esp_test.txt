@@ -1,0 +1,669 @@
+--@name Chip & Player ESP Test
+--@author test
+--@shared
+-- Config
+local chipsESPEnabled = false
+local playersESPEnabled = false
+local impactDebugEnabled = false
+
+if SERVER then
+    -- Chat commands
+    hook.add("PlayerSay", "ESP_ChatCommands", function(ply, text)
+        if ply ~= owner() then return end
+        
+        if text == "!chips" then
+            chipsESPEnabled = not chipsESPEnabled
+            print(Color(0,255,255), "[ESP] ", Color(255,255,255), "Chips ESP is now ", chipsESPEnabled and "enabled" or "disabled")
+            
+            net.start("ESP_SyncState")
+            net.writeBool(chipsESPEnabled)
+            net.writeBool(playersESPEnabled)
+            net.writeBool(impactDebugEnabled)
+            net.send(owner())
+            
+            return ""
+        end
+        
+        if text == "!players" then
+            playersESPEnabled = not playersESPEnabled
+            print(Color(0,255,255), "[ESP] ", Color(255,255,255), "Players ESP is now ", playersESPEnabled and "enabled" or "disabled")
+            
+            net.start("ESP_SyncState")
+            net.writeBool(chipsESPEnabled)
+            net.writeBool(playersESPEnabled)
+            net.writeBool(impactDebugEnabled)
+            net.send(owner())
+            
+            return ""
+        end
+        
+        if text == "!ammo" then
+            impactDebugEnabled = not impactDebugEnabled
+            print(Color(0,255,255), "[ESP] ", Color(255,255,255), "Impact Debug is now ", impactDebugEnabled and "enabled" or "disabled")
+            
+            net.start("ESP_SyncState")
+            net.writeBool(chipsESPEnabled)
+            net.writeBool(playersESPEnabled)
+            net.writeBool(impactDebugEnabled)
+            net.send(owner())
+            
+            return ""
+        end
+    end)
+    
+    -- Get chip quota on server
+    local function getChipQuota(ent)
+        if not isValid(ent) then return 0 end
+        local quota = 0
+        pcall(function()
+            quota = ent:getQuotaAverage() or 0
+        end)
+        return math.floor(quota * 1000000)
+    end
+    
+    -- Collect and send chip data to client
+    timer.create("ESP_SendChipData", 1, 0, function()
+        if not chipsESPEnabled then return end
+        
+        local chipData = {}
+        local ownerPos = owner():getPos()
+        
+        -- Collect SF chips
+        for _, sf in pairs(find.byClass("starfall_processor")) do
+            if isValid(sf) then
+                local quota = getChipQuota(sf)
+                local distance = sf:getPos():getDistance(ownerPos)
+                
+                -- Skip low-usage distant chips (less than 300us and further than 3000 units)
+                if quota < 300 and distance > 3000 then continue end
+                
+                local chipOwner = sf:getOwner()
+                table.insert(chipData, {
+                    entIndex = sf:entIndex(),
+                    chipType = "SF",
+                    name = sf:getChipName() ~= "" and sf:getChipName() or "<no name>",
+                    ownerName = isValid(chipOwner) and chipOwner:getName() or "disconnected",
+                    ownerTeam = isValid(chipOwner) and chipOwner:getTeam() or 0,
+                    quota = quota
+                })
+            end
+        end
+        
+        -- Collect E2 chips
+        for _, e2 in pairs(find.byClass("gmod_wire_expression2")) do
+            if isValid(e2) then
+                local quota = getChipQuota(e2)
+                local distance = e2:getPos():getDistance(ownerPos)
+                
+                -- Skip low-usage distant chips (less than 300us and further than 3000 units)
+                if quota < 300 and distance > 3000 then continue end
+                
+                local chipOwner = e2:getOwner()
+                table.insert(chipData, {
+                    entIndex = e2:entIndex(),
+                    chipType = "E2",
+                    name = e2:getChipName() ~= "" and e2:getChipName() or "<no name>",
+                    ownerName = isValid(chipOwner) and chipOwner:getName() or "disconnected",
+                    ownerTeam = isValid(chipOwner) and chipOwner:getTeam() or 0,
+                    quota = quota
+                })
+            end
+        end
+        
+        -- Collect white props
+        local whitePropData = {}
+        for _, ent in pairs(find.byClass("prop_physics")) do
+            if isValid(ent) then
+                local col = ent:getColor()
+                
+                if col.r == 255 and col.g == 255 and col.b == 255 and col.a == 100 then
+                    local entOwner = ent:getOwner()
+                    table.insert(whitePropData, {
+                        entIndex = ent:entIndex(),
+                        ownerName = isValid(entOwner) and entOwner:getName() or "disconnected",
+                        ownerTeam = isValid(entOwner) and entOwner:getTeam() or 0
+                    })
+                end
+            end
+        end
+        
+        net.start("ESP_ChipData")
+        net.writeTable(chipData)
+        net.writeTable(whitePropData)
+        net.send(owner())
+    end)
+    
+    -- Collect and send player data to client
+    timer.create("ESP_SendPlayerData", 2, 0, function()
+        if not playersESPEnabled then return end
+        
+        local playerData = {}
+        local allEnts = find.all()
+        
+        for _, ply in pairs(find.allPlayers()) do
+            if isValid(ply) and ply ~= owner() then
+                local mode = "UNKNOWN"
+                
+                if ply.isPVP and ply:isPVP() then
+                    mode = "PVP"
+                elseif ply.isBUILD and ply:isBUILD() then
+                    mode = "BUILD"
+                end
+                
+                -- Count entities
+                local entCount = 0
+                local maxChecks = 200
+                local checked = 0
+                for _, ent in pairs(allEnts) do
+                    if checked >= maxChecks then break end
+                    checked = checked + 1
+                    if isValid(ent) and isValid(ent:getOwner()) and ent:getOwner() == ply then
+                        entCount = entCount + 1
+                    end
+                end
+                
+                -- Get hours
+                local secondsPlayed = 0
+                if ply.getTimePlayed then
+                    secondsPlayed = ply:getTimePlayed() or 0
+                end
+                local hoursPlayed = math.floor(secondsPlayed / 3600)
+                
+                table.insert(playerData, {
+                    entIndex = ply:entIndex(),
+                    name = ply:getName(),
+                    team = ply:getTeam(),
+                    mode = mode,
+                    entCount = entCount,
+                    hoursPlayed = hoursPlayed
+                })
+            end
+        end
+        
+        net.start("ESP_PlayerData")
+        net.writeTable(playerData)
+        net.send(owner())
+    end)
+end
+
+if CLIENT then
+    
+    -- Only run for owner
+    if player() ~= owner() then return end
+    
+    -- Receive state from server
+    net.receive("ESP_SyncState", function()
+        chipsESPEnabled = net.readBool()
+        playersESPEnabled = net.readBool()
+        impactDebugEnabled = net.readBool()
+    end)
+    
+    -- Create fonts
+    local chipFont = render.createFont("Arial", 18, 800, true)
+    local playerFont = render.createFont("Arial", 18, 800, true)
+    local smallFont = render.createFont("Arial", 14, 700, true)
+    
+    -- Cached data (received from server)
+    local cachedChips = {}
+    local cachedPlayers = {}
+    local cachedWhiteProps = {}
+    
+    -- Receive chip data from server
+    net.receive("ESP_ChipData", function()
+        local chipData = net.readTable()
+        local whitePropData = net.readTable()
+        
+        -- Convert to renderable format
+        cachedChips = {}
+        for _, data in ipairs(chipData) do
+            local ent = entity(data.entIndex)
+            if isValid(ent) then
+                table.insert(cachedChips, {
+                    ent = ent,
+                    chipType = data.chipType,
+                    name = data.name,
+                    ownerName = data.ownerName,
+                    ownerColor = team.getColor(data.ownerTeam),
+                    quota = data.quota
+                })
+            end
+        end
+        
+        cachedWhiteProps = {}
+        for _, data in ipairs(whitePropData) do
+            local ent = entity(data.entIndex)
+            if isValid(ent) then
+                table.insert(cachedWhiteProps, {
+                    ent = ent,
+                    ownerName = data.ownerName,
+                    ownerColor = team.getColor(data.ownerTeam)
+                })
+            end
+        end
+    end)
+    
+    -- Receive player data from server
+    net.receive("ESP_PlayerData", function()
+        local playerData = net.readTable()
+        
+        cachedPlayers = {}
+        for _, data in ipairs(playerData) do
+            local ply = entity(data.entIndex)
+            if isValid(ply) then
+                local modeColor = Color(255, 255, 255)
+                if data.mode == "PVP" then
+                    modeColor = Color(180, 0, 255)
+                elseif data.mode == "BUILD" then
+                    modeColor = Color(255, 100, 200)
+                end
+                
+                table.insert(cachedPlayers, {
+                    ply = ply,
+                    name = data.name,
+                    nameColor = team.getColor(data.team),
+                    mode = data.mode,
+                    modeColor = modeColor,
+                    entCount = data.entCount,
+                    entColor = getEntityCountColor(data.entCount),
+                    hoursPlayed = data.hoursPlayed,
+                    hoursColor = getHoursColor(data.hoursPlayed)
+                })
+            end
+        end
+    end)
+    
+    -- Get color based on CPU usage (green to red gradient)
+    local function getCPUColor(usage)
+        if usage <= 500 then return Color(0, 255, 0) end -- Green for low usage
+        if usage >= 2000 then return Color(255, 0, 0) end -- Red for high usage
+        
+        local ratio = (usage - 500) / 1500
+        local r = math.floor(255 * ratio)
+        local g = math.floor(255 * (1 - ratio))
+        return Color(r, g, 0)
+    end
+    
+    -- Draw corner brackets around text
+    local function drawCornerBrackets(x, y, w, h, color, thickness)
+        local cornerSize = 8
+        thickness = thickness or 2
+        
+        render.setColor(color)
+        
+        -- Top-left corner
+        render.drawRectFast(x, y, cornerSize, thickness)
+        render.drawRectFast(x, y, thickness, cornerSize)
+        
+        -- Top-right corner
+        render.drawRectFast(x + w - cornerSize, y, cornerSize, thickness)
+        render.drawRectFast(x + w - thickness, y, thickness, cornerSize)
+        
+        -- Bottom-left corner
+        render.drawRectFast(x, y + h - thickness, cornerSize, thickness)
+        render.drawRectFast(x, y + h - cornerSize, thickness, cornerSize)
+        
+        -- Bottom-right corner
+        render.drawRectFast(x + w - cornerSize, y + h - thickness, cornerSize, thickness)
+        render.drawRectFast(x + w - thickness, y + h - cornerSize, thickness, cornerSize)
+    end
+    
+    -- Get gradient color for entity count (green to red)
+    local function getEntityCountColor(count)
+        if count <= 0 then return Color(0, 255, 0) end
+        if count >= 200 then return Color(255, 0, 0) end
+        
+        local ratio = count / 200
+        local r = math.floor(255 * ratio)
+        local g = math.floor(255 * (1 - ratio))
+        return Color(r, g, 0)
+    end
+    
+    -- Get gradient color for hours (red -> yellow -> green)
+    local function getHoursColor(hours)
+        if hours <= 0 then return Color(255, 0, 0) end
+        if hours >= 300 then return Color(0, 255, 0) end
+        
+        if hours <= 100 then
+            local ratio = hours / 100
+            return Color(255, math.floor(255 * ratio), 0)
+        else
+            local ratio = (hours - 100) / 200
+            return Color(math.floor(255 * (1 - ratio)), 255, 0)
+        end
+    end
+    
+    -- ============= CHIPS ESP =============
+    
+    -- Draw chip wireframes
+    hook.add("postdrawopaquerenderables", "DrawChipsWireframes", function()
+        if not chipsESPEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.8 then return end
+        for _, data in ipairs(cachedChips) do
+            if not isValid(data.ent) then continue end
+            
+            local mins, maxs = data.ent:obbMins(), data.ent:obbMaxs()
+            
+            if data.chipType == "SF" then
+                render.setColor(Color(0, 255, 255))
+            else
+                render.setColor(Color(255, 0, 0))
+            end
+            
+            render.draw3DWireframeBox(data.ent:getPos(), data.ent:getAngles(), mins, maxs, true)
+        end
+        
+        for _, data in ipairs(cachedWhiteProps) do
+            if not isValid(data.ent) then continue end
+            
+            local mins, maxs = data.ent:obbMins(), data.ent:obbMaxs()
+            render.setColor(Color(255, 255, 0, 150))
+            render.draw3DWireframeBox(data.ent:getPos(), data.ent:getAngles(), mins, maxs, true)
+        end
+    end)
+    
+    -- Draw chip info
+    hook.add("drawhud", "DrawChipsInfo", function()
+        if not chipsESPEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.8 then return end
+        render.setFont(chipFont)
+        
+        for _, data in ipairs(cachedChips) do
+            if not isValid(data.ent) then continue end
+            
+            local pos = data.ent:getPos():toScreen()
+            if not pos.visible then continue end
+            
+            -- Dynamic background size based on text length
+            local nameWidth = render.getTextSize(data.name)
+            local ownerWidth = render.getTextSize(data.ownerName)
+            local maxWidth = math.max(nameWidth, ownerWidth, 80)
+            local bgWidth = maxWidth + 40
+            local bgHeight = 55
+            local bgX = pos.x - bgWidth/2
+            local bgY = pos.y - 15
+            
+            -- Semi-transparent background
+            render.setColor(Color(0, 0, 0, 200))
+            render.drawRectFast(bgX, bgY, bgWidth, bgHeight)
+            
+            -- Corner brackets with CPU-based color
+            local cpuColor = getCPUColor(data.quota)
+            drawCornerBrackets(bgX, bgY, bgWidth, bgHeight, cpuColor, 2)
+            
+            if data.chipType == "SF" then
+                render.setColor(Color(0, 255, 255))
+                render.drawText(pos.x, pos.y - 10, "[SF] " .. data.name, 1)
+            else
+                render.setColor(Color(255, 0, 0))
+                render.drawText(pos.x, pos.y - 10, "[E2] " .. data.name, 1)
+            end
+            
+            render.setColor(data.ownerColor)
+            render.drawText(pos.x, pos.y + 8, data.ownerName, 1)
+            
+            render.setColor(cpuColor)
+            render.drawText(pos.x, pos.y + 26, data.quota .. "us", 1)
+        end
+        
+        for _, data in ipairs(cachedWhiteProps) do
+            if not isValid(data.ent) then continue end
+            
+            local pos = data.ent:getPos():toScreen()
+            if not pos.visible then continue end
+            
+            -- Dynamic background
+            local ownerWidth = render.getTextSize(data.ownerName)
+            local bgWidth = ownerWidth + 20
+            local bgHeight = 22
+            local bgX = pos.x - bgWidth/2
+            local bgY = pos.y - 8
+            
+            render.setColor(Color(0, 0, 0, 200))
+            render.drawRectFast(bgX, bgY, bgWidth, bgHeight)
+            
+            -- Yellow corners for white props
+            drawCornerBrackets(bgX, bgY, bgWidth, bgHeight, Color(255, 255, 0), 2)
+            
+            render.setColor(data.ownerColor)
+            render.drawText(pos.x, pos.y, data.ownerName, 1)
+        end
+    end)
+    
+    -- ============= PLAYERS ESP =============
+    
+    -- Draw player wireframes
+    hook.add("postdrawopaquerenderables", "DrawPlayersWireframes", function()
+        if not playersESPEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.8 then return end
+        for _, data in ipairs(cachedPlayers) do
+            if not isValid(data.ply) then continue end
+            
+            local mins, maxs = data.ply:obbMins(), data.ply:obbMaxs()
+            render.setColor(Color(0, 255, 0, 100))
+            render.draw3DWireframeBox(data.ply:getPos(), data.ply:getAngles(), mins, maxs, true)
+        end
+    end)
+    
+    -- Draw player info
+    hook.add("drawhud", "DrawPlayersInfo", function()
+        if not playersESPEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.8 then return end
+        for _, data in ipairs(cachedPlayers) do
+            if not isValid(data.ply) then continue end
+            
+            local pos = data.ply:getPos():toScreen()
+            if not pos.visible then continue end
+            
+            -- Dynamic background size
+            local nameWidth = render.getTextSize(data.name)
+            local bgWidth = math.max(nameWidth + 40, 150)
+            local bgHeight = 60
+            local bgX = pos.x - bgWidth/2
+            local bgY = pos.y - 15
+            
+            -- Semi-transparent background
+            render.setColor(Color(0, 0, 0, 200))
+            render.drawRectFast(bgX, bgY, bgWidth, bgHeight)
+            
+            -- Corner brackets (green for low ent count, red for high)
+            local cornerColor = data.entColor
+            drawCornerBrackets(bgX, bgY, bgWidth, bgHeight, cornerColor, 2)
+            
+            -- Player name
+            render.setFont(playerFont)
+            render.setColor(data.nameColor)
+            render.drawText(pos.x, pos.y - 10, data.name, 1)
+            
+            -- Mode
+            render.setFont(smallFont)
+            render.setColor(data.modeColor)
+            render.drawText(pos.x, pos.y + 8, data.mode, 1)
+            
+            -- Entity count (left)
+            render.setColor(data.entColor)
+            render.drawText(pos.x - 35, pos.y + 26, "E:" .. data.entCount, 1)
+            
+            -- Hours (right)
+            render.setColor(data.hoursColor)
+            render.drawText(pos.x + 20, pos.y + 26, data.hoursPlayed .. "h", 1)
+        end
+    end)
+    -- ============= END PLAYERS ESP SYSTEM =============
+    
+    -- ============= IMPACT DEBUG SYSTEM =============
+    local impactMarkers = {} -- {pos, time, isHit, startPos}
+    local nearbyEntities = {} -- Cache nearby entities for hitbox rendering
+    local lastWeaponFire = 0
+    local lastHitboxUpdate = 0
+    local HITBOX_RADIUS = 500
+    local IMPACT_LIFETIME = 5
+    
+    -- Update nearby entities for hitbox rendering
+    local function updateNearbyEntities()
+        if not impactDebugEnabled then
+            nearbyEntities = {}
+            return
+        end
+        if not isValid(owner()) then return end
+        
+        local ownerPos = owner():getPos()
+        nearbyEntities = find.inSphere(ownerPos, HITBOX_RADIUS)
+        
+        -- Always include all players regardless of distance for eye trace
+        for _, ply in ipairs(find.allPlayers()) do
+            if isValid(ply) and ply ~= owner() then
+                if not table.hasValue(nearbyEntities, ply) then
+                    table.insert(nearbyEntities, ply)
+                end
+            end
+        end
+    end
+    
+    -- Hook weapon firing using InputPressed
+    hook.add("InputPressed", "ImpactDebug_Input", function(button)
+        if not impactDebugEnabled then return end
+        
+        -- Check if it's left mouse button (MOUSE.LEFT = 107)
+        if button ~= MOUSE.LEFT and button ~= MOUSE.RIGHT then return end
+        
+        local now = timer.curtime()
+        if now - lastWeaponFire < 0.05 then return end -- Debounce
+        lastWeaponFire = now
+        
+        -- Perform trace from eye position
+        local eyePos = owner():getEyePos()
+        local eyeAng = owner():getEyeAngles()
+        local endPos = eyePos + eyeAng:getForward() * 50000
+        
+        -- Create filter that includes players
+        local tr = trace.trace(eyePos, endPos, owner())
+        
+        if tr.Hit then
+            table.insert(impactMarkers, {
+                pos = tr.HitPos,
+                time = now,
+                isHit = isValid(tr.Entity),
+                startPos = eyePos
+            })
+        end
+    end)
+    
+    -- Update nearby entities periodically
+    hook.add("think", "ImpactDebug_UpdateEnts", function()
+        if not impactDebugEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.9 then return end
+        local now = timer.curtime()
+        if now - lastHitboxUpdate > 0.5 then
+            lastHitboxUpdate = now
+            updateNearbyEntities()
+        end
+    end)
+    
+    -- Render hitboxes and impact markers
+    hook.add("postdrawopaquerenderables", "ImpactDebug_Draw", function()
+        if not impactDebugEnabled then return end
+        if cpuTotalAverage() > cpuMax() * 0.9 then return end
+        local now = timer.curtime()
+        
+        -- Draw impact markers and bullet traces
+        for i = #impactMarkers, 1, -1 do
+            local impact = impactMarkers[i]
+            local age = now - impact.time
+            
+            if age > IMPACT_LIFETIME then
+                table.remove(impactMarkers, i)
+            else
+                local alpha = math.floor(255 * (1 - age / IMPACT_LIFETIME))
+                
+                -- Draw bullet trace line (green)
+                render.setColor(Color(0, 255, 0, alpha))
+                render.draw3DLine(impact.startPos, impact.pos, true)
+                
+                -- Draw impact point as wireframe box
+                local impactColor = impact.isHit and Color(255, 0, 0) or Color(0, 100, 255)
+                render.setColor(Color(impactColor.r, impactColor.g, impactColor.b, alpha))
+                render.draw3DWireframeBox(impact.pos, Angle(0,0,0), Vector(-3,-3,-3), Vector(3,3,3), true)
+            end
+        end
+        
+        -- Draw player eye traces
+        for _, ply in ipairs(find.allPlayers()) do
+            if not isValid(ply) then continue end
+            if ply == owner() then continue end
+            
+            local eyePos = ply:getEyePos()
+            local eyeAng = ply:getEyeAngles()
+            local endPos = eyePos + eyeAng:getForward() * 10000
+            local tr = trace.line(eyePos, endPos, ply)
+            
+            if tr.Hit then
+                -- Check if looking at a player
+                local isLookingAtPlayer = isValid(tr.Entity) and tr.Entity:isPlayer()
+                local traceColor = isLookingAtPlayer and Color(255, 0, 0, 150) or Color(100, 100, 255, 80)
+                
+                render.setColor(traceColor)
+                render.draw3DLine(eyePos, tr.HitPos, true)
+            end
+        end
+        
+        -- Draw OBB hitboxes for nearby entities with color coding
+        for _, ent in ipairs(nearbyEntities) do
+            if not isValid(ent) then continue end
+            if ent == owner() then continue end
+            
+            local hitboxColor = Color(255, 255, 255, 100)
+            
+            -- Special handling for players - use hull bounds instead of OBB
+            if ent:isPlayer() then
+                local teamColor = team.getColor(ent:getTeam())
+                hitboxColor = Color(teamColor.r, teamColor.g, teamColor.b, 150)
+                
+                -- Use hull mins/maxs for accurate player hitbox
+                local mins = ent:obbMins()
+                local maxs = ent:obbMaxs()
+                
+                -- Draw player capsule approximation
+                local pos = ent:getPos()
+                local ang = ent:getAngles()
+                
+                render.setColor(hitboxColor)
+                render.draw3DWireframeBox(pos, ang, mins, maxs, true)
+                
+            elseif ent:isNPC() then
+                hitboxColor = Color(255, 150, 0, 120)
+                local mins, maxs = ent:obbMins(), ent:obbMaxs()
+                render.setColor(hitboxColor)
+                render.draw3DWireframeBox(ent:getPos(), ent:getAngles(), mins, maxs, true)
+                
+            elseif ent:isVehicle() then
+                hitboxColor = Color(0, 255, 255, 120)
+                local mins, maxs = ent:obbMins(), ent:obbMaxs()
+                render.setColor(hitboxColor)
+                render.draw3DWireframeBox(ent:getPos(), ent:getAngles(), mins, maxs, true)
+                
+            else
+                -- Props and other entities
+                local entOwner = ent:getOwner()
+                if isValid(entOwner) then
+                    if entOwner == owner() then
+                        hitboxColor = Color(0, 255, 0, 120)
+                    else
+                        local teamColor = team.getColor(entOwner:getTeam())
+                        hitboxColor = Color(teamColor.r, teamColor.g, teamColor.b, 100)
+                    end
+                else
+                    hitboxColor = Color(150, 150, 150, 80)
+                end
+                
+                local mins, maxs = ent:obbMins(), ent:obbMaxs()
+                render.setColor(hitboxColor)
+                render.draw3DWireframeBox(ent:getPos(), ent:getAngles(), mins, maxs, true)
+            end
+        end
+    end)
+    -- ============= END IMPACT DEBUG SYSTEM =============
+    
+    -- Enable HUD
+    enableHud(player(), true)
+    
+end
