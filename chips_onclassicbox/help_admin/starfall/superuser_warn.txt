@@ -8,11 +8,18 @@ function owner() return chip():getOwner() end
 
 --[[ CONFIG ]]--
 local WARN_DURATION = 20 -- seconds
-local WARN_SOUND_URL = "https://www.myinstants.com/media/sounds/ford-warning-door-chime.mp3"
-local WARN_IMAGE_URL = "https://i.imgur.com/O0rUsf5.png"
-local TELEPORT_INTERVAL = 0.5 -- seconds between teleports
-local REMOVE_ENTITIES_RULES = {"1.4", "1.5"} -- Rules that trigger entity removal
+local WARN_SOUND_URL = "https://www.myinstants.com/media/sounds/ford-warning-door-chime.mp3" --"https://github.com/TheLovelyMask/starfallthngs/raw/refs/heads/main/othercrap/raid.mp3"
+local WARN_IMAGE_URL = "https://i.imgur.com/O0rUsf5.png" --"https://i.imgur.com/XrbOtZl.png"
+local TELEPORT_INTERVAL = 0.1 -- seconds between teleports
+local REMOVE_ENTITIES_RULES = {"1.4"} -- Rules that trigger entity removal
 local REMOVE_ENTITIES_ENABLED = true -- Toggle for entity removal feature
+
+-- Broadcast warn config
+local BROADCAST_DURATION = 8 -- seconds
+local BROADCAST_IMAGE_URL =  "https://i.imgur.com/pl8P4cR.png" -- @ "https://i.imgur.com/U5mI1rr.png"
+local BROADCAST_SOUND_URL = "https://www.myinstants.com/media/sounds/stupid-f__king-bird.mp3"
+local BROADCAST_FADE_TIME = 5 -- seconds for fade in/out
+local BROADCAST_EXCLUDED_GROUPS = {"ivent"} -- User groups excluded from broadcast
 
 --[[ HELPER FUNCTIONS ]]--
 local function getColor(plr)
@@ -226,6 +233,66 @@ if SERVER then
         
         return "" -- Hide command from chat
     end)
+    
+    -- Broadcast warn command (shows to all players except in combat and admins)
+    hook.add("PlayerSay", "WarnSystem_BroadcastCommand", function(ply, text)
+        -- Check if it's a broadcast command
+        local cmd = text:lower():match("^!(%w+)")
+        if cmd ~= "broadcast" and cmd ~= "bc" then return end
+        
+        -- Only owner can use
+        if ply ~= owner() then 
+            chatLog(Color(255,100,100), "Unauthorized broadcast attempt by ", getColor(ply), getName(ply))
+            return ""
+        end
+        
+        -- Parse arguments: !broadcast Reason
+        local args = {}
+        for word in text:gmatch("%S+") do
+            table.insert(args, word)
+        end
+        
+        -- Need at least 2 args: !broadcast reason
+        if #args < 2 then
+            chatLog(Color(255,100,100), "Usage: !broadcast <reason>")
+            return ""
+        end
+        
+        local reason = args[2]
+        
+        -- Send broadcast to all eligible players
+        local sentCount = 0
+        for _, target in ipairs(find.allPlayers()) do
+            if not isValid(target) then continue end
+            
+            -- Skip if in combat
+            if target:isInCombat() then continue end
+            
+            -- Skip if in excluded user group
+            local isExcluded = false
+            for _, group in ipairs(BROADCAST_EXCLUDED_GROUPS) do
+                if target:isUserGroup(group) then
+                    isExcluded = true
+                    break
+                end
+            end
+            if isExcluded then continue end
+            
+            -- Send broadcast to this player
+            pcall(function()
+                net.start("WarnSystem_Broadcast")
+                net.writeString(reason)
+                net.writeFloat(BROADCAST_DURATION)
+                net.send(target)
+            end)
+            
+            sentCount = sentCount + 1
+        end
+        
+        chatLog("Broadcast sent to ", Color(100,255,100), sentCount, Color(255,255,255), " players with reason: ", Color(255,200,100), reason)
+        
+        return "" -- Hide command from chat
+    end)
 end
 
 --[[ CLIENT LOGIC ]]--
@@ -294,7 +361,7 @@ if CLIENT then
             if sound then
                 --print(Color(0,255,0), "[Warn] ", Color(255,255,255), "Sound loaded!")
                 sound:setPos(soundPos)
-                sound:setVolume(1)
+                sound:setVolume(10)
                 sound:setLooping(false)
                 sound:play()
                 
@@ -383,4 +450,112 @@ if CLIENT then
             return true -- Block all input
         end
     end)
+    
+    -- ============= BROADCAST SYSTEM =============
+    local broadcastActive = false
+    local broadcastReason = ""
+    local broadcastEndTime = 0
+    local broadcastMaterial = nil
+    local broadcastStartTime = 0
+    
+    -- Receive broadcast
+    net.receive("WarnSystem_Broadcast", function()
+        local reason = net.readString()
+        local duration = net.readFloat()
+        
+        broadcastActive = true
+        broadcastReason = reason
+        broadcastStartTime = timer.curtime()
+        broadcastEndTime = timer.curtime() + duration
+        
+        ensureFont()
+        
+        -- Reuse same material
+        if not broadcastMaterial then
+            render.createMaterial(BROADCAST_IMAGE_URL, function(mat, url, w, h)
+                if mat then
+                    broadcastMaterial = mat
+                end
+            end)
+        end
+        
+        -- Play broadcast sound
+        bass.loadURL(BROADCAST_SOUND_URL, "noblock", function(sound, errID, errName)
+            if sound then
+                sound:setVolume(0.7)
+                sound:setLooping(false)
+                sound:play()
+                
+                timer.simple(duration + 1, function()
+                    if sound and sound:isValid() then
+                        sound:stop()
+                    end
+                end)
+            end
+        end)
+    end)
+    
+    -- Render broadcast screen with fade (announcement style)
+    hook.add("drawhud", "WarnSystem_DrawBroadcast", function()
+        if not broadcastActive then return end
+        
+        local now = timer.curtime()
+        
+        -- Check if time expired
+        if now >= broadcastEndTime then
+            broadcastActive = false
+            return
+        end
+        
+        if not broadcastMaterial then return end
+        
+        local screenW, screenH = render.getResolution()
+        
+        -- Calculate fade alpha
+        local elapsed = now - broadcastStartTime
+        local timeLeft = broadcastEndTime - now
+        local alpha = 255
+        
+        -- Fade in
+        if elapsed < BROADCAST_FADE_TIME then
+            alpha = math.floor(255 * (elapsed / BROADCAST_FADE_TIME))
+        -- Fade out
+        elseif timeLeft < BROADCAST_FADE_TIME then
+            alpha = math.floor(255 * (timeLeft / BROADCAST_FADE_TIME))
+        end
+        
+        -- Draw image with fade
+        render.setViewPort(0, 0, screenW, screenH)
+        render.setMaterial(broadcastMaterial)
+        render.setColor(Color(255, 255, 255, alpha))
+        
+        local imgW = broadcastMaterial:getWidth()
+        local imgH = broadcastMaterial:getHeight()
+        
+        -- FIT scaling
+        local scale = math.min(screenW / imgW, screenH / imgH)
+        local drawW = imgW * scale
+        local drawH = imgH * scale
+        local x = (screenW - drawW) * 0.5
+        local y = (screenH - drawH) * 0.5
+        
+        render.drawTexturedRect(x, y, drawW, drawH)
+        
+        -- Draw reason text at bottom
+        render.setFont(warnFont)
+        
+        local reasonText = broadcastReason
+        local textW, textH = render.getTextSize(reasonText)
+        local textX = screenW / 2 - textW / 2
+        local textY = screenH - 150
+        
+        -- Shadow
+        render.setColor(Color(0, 0, 0, alpha))
+        render.drawText(textX + 2, textY + 2, reasonText, 0)
+        
+        -- Text
+        render.setColor(Color(255, 50, 50, alpha))
+        render.drawText(textX, textY, reasonText, 0)
+    end)
+    -- ============= END BROADCAST SYSTEM =============
 end

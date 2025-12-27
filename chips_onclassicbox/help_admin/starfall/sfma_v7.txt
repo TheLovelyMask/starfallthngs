@@ -51,7 +51,7 @@ SFMA.HUD = {
     -- y will be computed each frame to be vertically centered
     lineHeight = 24,        -- spacing between messages (pixels)
     defaultDuration = 10.0,  -- seconds each message lives
-    maxMessages = 3,       -- cap kept for internal queue
+    maxMessages = 7,       -- cap kept for internal queue
     bgWidth = 420,          -- background rect width
     bgHeight = 22           -- background rect height per message
 }
@@ -124,6 +124,37 @@ function SFMA.logOffender( plr, ping )
     end)
 
     if SERVER then
+
+    -- ============= KILLSTREAK TRACKING =============
+    local killStreaks = {} -- [player] = kill count
+    
+    hook.add("PlayerDeath", "SFMA_TrackKillstreaks", function(victim, inflictor, attacker)
+        if not isValid(victim) then return end
+        
+        -- Reset victim's killstreak
+        killStreaks[victim] = 0
+        
+        -- Increment attacker's killstreak
+        if isValid(attacker) and attacker:isPlayer() and attacker ~= victim then
+            killStreaks[attacker] = (killStreaks[attacker] or 0) + 1
+            local streak = killStreaks[attacker]
+            
+            if streak >= 5 then
+                local msg = getName(attacker) .. " is on a " .. streak .. " kill streak!"
+                SFMA.consoleLog(Color(255, 100, 100), msg)
+                
+                -- Send to HUD
+                pcall(function()
+                    net.start("SFMA_notify")
+                    net.writeEntity(attacker)
+                    net.writeString("killstreak: " .. streak .. " kills")
+                    net.writeString("killstreak")
+                    net.send(owner())
+                end)
+            end
+        end
+    end)
+    -- ============= END KILLSTREAK TRACKING =============
         -- send net to owner only (owner receives and will show HUD)
         pcall(function()
             net.start("SFMA_logOffender")
@@ -245,6 +276,46 @@ ChatCommands:add({
         SFMA.chatLog("Hologram display is ", holosEnabled and Color(50,255,50) or Color(255,50,50), holosEnabled and "enabled" or "disabled", Color(255,255,255), ".")
     end
 })
+
+--[[ chips ESP command
+SFMA.chipsESPEnabled = false
+ChatCommands:add({
+    Name = "chips",
+    Description = "Toggles chip ESP visualization (shows all SF/E2 chips with wireframe boxes).",
+    Aliases = {"chip", "chipesp"},
+    Arguments = {
+        { Name = "State", Type = "bool", Optional = true }
+    },
+    Run = function( user, state )
+        if user ~= owner() then return end
+        
+        local newState
+        if state == nil then newState = not SFMA.chipsESPEnabled else newState = state end
+        SFMA.chipsESPEnabled = newState
+        
+        SFMA.chatLog("Chip ESP is ", newState and Color(50,255,50) or Color(255,50,50), newState and "enabled" or "disabled", Color(255,255,255), ".")
+    end
+})
+
+-- players ESP command
+SFMA.playersESPEnabled = false
+ChatCommands:add({
+    Name = "players",
+    Description = "Toggles player ESP visualization (shows player info, mode, entity count, hours).",
+    Aliases = {"player", "playeresp"},
+    Arguments = {
+        { Name = "State", Type = "bool", Optional = true }
+    },
+    Run = function( user, state )
+        if user ~= owner() then return end
+        
+        local newState
+        if state == nil then newState = not SFMA.playersESPEnabled else newState = state end
+        SFMA.playersESPEnabled = newState
+        
+        SFMA.chatLog("Player ESP is ", newState and Color(50,255,50) or Color(255,50,50), newState and "enabled" or "disabled", Color(255,255,255), ".")
+    end
+})--]]
 
 -- physlag command (toggle physics lag detection)
 ChatCommands:add({
@@ -799,14 +870,18 @@ if SERVER then
                 if not isValid(entOwner) then return end
 
                 local payload = {Color(231,220,117), entClass}
+                local hudMessage = ""
 
                 if entClass == "gmod_wire_expression2" or entClass == "starfall_processor" then
                     local isE2 = entClass == "gmod_wire_expression2"
+                    local chipName = ent:isValid() and ent:getChipName() or "[deleted]"
 
                     payload = {
                         isE2 and Color(255,0,0) or Color(0,144,255), isE2 and "Expression 2" or "Starfall",
-                        Color(255,255,255), " chip named ", Color(255,255,144), ent:isValid() and ent:getChipName() or "[deleted]", Color(255,255,255)
+                        Color(255,255,255), " chip named ", Color(255,255,144), chipName, Color(255,255,255)
                     }
+                    
+                    hudMessage = "spawned " .. (isE2 and "E2" or "SF") .. ": " .. chipName
                 elseif entClass == "quad_prop" then
                     if not isValid(ent) then return end
 
@@ -821,12 +896,25 @@ if SERVER then
                         table.insert(payload, Color(255,255,144))
                         table.insert(payload, mat)
                     end
+                    
+                    hudMessage = "spawned QuadProp"
                 end
 
                 table.insert(payload, Color(255,255,255))
                 table.insert(payload, ".")
 
                 SFMA.consoleLog(getColor(entOwner), getName(entOwner), Color(255,255,255), " spawned ", unpack(payload))
+                
+                -- Send to HUD
+                if hudMessage ~= "" then
+                    pcall(function()
+                        net.start("SFMA_notify")
+                        net.writeEntity(entOwner)
+                        net.writeString(hudMessage)
+                        net.writeString("spawn")
+                        net.send(owner())
+                    end)
+                end
             end)
         end
     end)
@@ -971,7 +1059,18 @@ if SERVER then
             end
         end
         if #allEnts == 0 then return end
-        SFMA.consoleLog( getColor(ply), getName(ply), Color(255,255,255), " unfroze ", Color(255,255,144), #allEnts, Color(255,255,255), " entities!" )
+        
+        local count = #allEnts
+        SFMA.consoleLog( getColor(ply), getName(ply), Color(255,255,255), " unfroze ", Color(255,255,144), count, Color(255,255,255), " entities!" )
+        
+        -- Send to HUD
+        pcall(function()
+            net.start("SFMA_notify")
+            net.writeEntity(ply)
+            net.writeString("unfroze " .. count .. " entities")
+            net.writeString("unfreeze")
+            net.send(owner())
+        end)
     end)
 end -- SERVER
 
@@ -1243,6 +1342,260 @@ if CLIENT then
         enableHud(owner(), true)
     end
     -- ============= END IMPACT DEBUG SYSTEM =============
+    
+    -- ============= CHIPS ESP SYSTEM =============
+    local chipFont = render.createFont("Arial", 14, 800, true)
+    
+    -- Get quota in microseconds
+    local function getChipQuota(ent)
+        local quota = 0
+        pcall(function() quota = ent:getQuotaAverage() end)
+        return math.round((quota or 0) * 1000000)
+    end
+    
+    -- Draw chips ESP - wireframe boxes and info
+    hook.add("postdrawopaquerenderables", "SFMA_DrawChipsESP", function()
+        if player() ~= owner() then return end
+        if not SFMA.chipsESPEnabled then return end
+        
+        -- Draw Starfall chips
+        for _, sf in pairs(find.byClass("starfall_processor")) do
+            if not isValid(sf) or sf == chip() then continue end
+            
+            local mins, maxs = sf:obbMins(), sf:obbMaxs()
+            render.setColor(Color(0, 255, 255))
+            render.draw3DWireframeBox(sf:getPos(), sf:getAngles(), mins, maxs, true)
+        end
+        
+        -- Draw Expression2 chips
+        for _, e2 in pairs(find.byClass("gmod_wire_expression2")) do
+            if not isValid(e2) then continue end
+            
+            local mins, maxs = e2:obbMins(), e2:obbMaxs()
+            render.setColor(Color(255, 0, 0))
+            render.draw3DWireframeBox(e2:getPos(), e2:getAngles(), mins, maxs, true)
+        end
+        
+        -- Draw white-colored entities (lag indicator)
+        for _, ent in pairs(find.all()) do
+            if not isValid(ent) then continue end
+            if ent:getClass() ~= "prop_physics" then continue end
+            
+            local col = Color(0,0,0)
+            pcall(function() col = ent:getColor() end)
+            if col.r == 255 and col.g == 255 and col.b == 255 and col.a == 100 then
+                local mins, maxs = ent:obbMins(), ent:obbMaxs()
+                render.setColor(Color(255, 255, 0, 150))
+                render.draw3DWireframeBox(ent:getPos(), ent:getAngles(), mins, maxs, true)
+            end
+        end
+    end)
+    
+    -- Draw chip text info
+    hook.add("drawhud", "SFMA_DrawChipsInfo", function()
+        if player() ~= owner() then return end
+        if not SFMA.chipsESPEnabled then return end
+        
+        render.setFont(chipFont)
+        
+        -- Draw Starfall chips info
+        for _, sf in pairs(find.byClass("starfall_processor")) do
+            if not isValid(sf) or sf == chip() then continue end
+            
+            local chipName = sf:getChipName()
+            if chipName == "" then chipName = "<no name>" end
+            
+            local chipOwner = sf:getOwner()
+            local ownerName = "disconnected"
+            local ownerColor = Color(100, 100, 100)
+            
+            if isValid(chipOwner) then
+                ownerName = chipOwner:getName()
+                ownerColor = team.getColor(chipOwner:getTeam())
+            end
+            
+            local quota = getChipQuota(sf)
+            local pos = sf:getPos():toScreen()
+            
+            if pos.visible then
+                render.setColor(Color(0, 255, 255))
+                render.drawText(pos.x, pos.y - 10, "[SF] " .. chipName, 1)
+                
+                render.setColor(ownerColor)
+                render.drawText(pos.x, pos.y + 5, ownerName, 1)
+                
+                render.setColor(Color(150, 150, 150))
+                render.drawText(pos.x, pos.y + 20, quota .. "us", 1)
+            end
+        end
+        
+        -- Draw Expression2 chips info
+        for _, e2 in pairs(find.byClass("gmod_wire_expression2")) do
+            if not isValid(e2) then continue end
+            
+            local chipName = e2:getChipName()
+            if chipName == "" then chipName = "<no name>" end
+            
+            local chipOwner = e2:getOwner()
+            local ownerName = "disconnected"
+            local ownerColor = Color(100, 100, 100)
+            
+            if isValid(chipOwner) then
+                ownerName = chipOwner:getName()
+                ownerColor = team.getColor(chipOwner:getTeam())
+            end
+            
+            local quota = getChipQuota(e2)
+            local pos = e2:getPos():toScreen()
+            
+            if pos.visible then
+                render.setColor(Color(255, 0, 0))
+                render.drawText(pos.x, pos.y - 10, "[E2] " .. chipName, 1)
+                
+                render.setColor(ownerColor)
+                render.drawText(pos.x, pos.y + 5, ownerName, 1)
+                
+                render.setColor(Color(150, 150, 150))
+                render.drawText(pos.x, pos.y + 20, quota .. "us", 1)
+            end
+        end
+        
+        -- Draw white-colored entities owner name
+        for _, ent in pairs(find.all()) do
+            if not isValid(ent) then continue end
+            if ent:getClass() ~= "prop_physics" then continue end
+            
+            local col = Color(0,0,0)
+            pcall(function() col = ent:getColor() end)
+            if col.r == 255 and col.g == 255 and col.b == 255 and col.a == 100 then
+                local entOwner = ent:getOwner()
+                local ownerName = "disconnected"
+                local ownerColor = Color(100, 100, 100)
+                
+                if isValid(entOwner) then
+                    ownerName = entOwner:getName()
+                    ownerColor = team.getColor(entOwner:getTeam())
+                end
+                
+                local pos = ent:getPos():toScreen()
+                if pos.visible then
+                    render.setColor(ownerColor)
+                    render.drawText(pos.x, pos.y, ownerName, 1)
+                end
+            end
+        end
+    end)
+    -- ============= END CHIPS ESP SYSTEM =============
+    
+    -- ============= PLAYERS ESP SYSTEM =============
+    local playerFont = render.createFont("Arial", 14, 800, true)
+    local smallFont = render.createFont("Arial", 11, 600, true)
+    
+    -- Get gradient color for entity count (green to red)
+    local function getEntityCountColor(count)
+        if count <= 0 then return Color(0, 255, 0) end
+        if count >= 200 then return Color(255, 0, 0) end
+        
+        local ratio = count / 200
+        local r = math.floor(255 * ratio)
+        local g = math.floor(255 * (1 - ratio))
+        return Color(r, g, 0)
+    end
+    
+    -- Get gradient color for hours (red -> yellow -> green)
+    local function getHoursColor(hours)
+        if hours <= 0 then return Color(255, 0, 0) end
+        if hours >= 300 then return Color(0, 255, 0) end
+        
+        if hours <= 100 then
+            -- Red to yellow (0-100 hours)
+            local ratio = hours / 100
+            return Color(255, math.floor(255 * ratio), 0)
+        else
+            -- Yellow to green (100-300 hours)
+            local ratio = (hours - 100) / 200
+            return Color(math.floor(255 * (1 - ratio)), 255, 0)
+        end
+    end
+    
+    -- Draw player hitboxes
+    hook.add("postdrawopaquerenderables", "SFMA_DrawPlayersESP", function()
+        if player() ~= owner() then return end
+        if not SFMA.playersESPEnabled then return end
+        
+        for _, ply in pairs(find.allPlayers()) do
+            if not isValid(ply) then continue end
+            if ply == owner() then continue end
+            
+            local mins, maxs = ply:obbMins(), ply:obbMaxs()
+            render.setColor(Color(0, 255, 0, 100))
+            render.draw3DWireframeBox(ply:getPos(), ply:getAngles(), mins, maxs, true)
+        end
+    end)
+    
+    -- Draw player info
+    hook.add("drawhud", "SFMA_DrawPlayersInfo", function()
+        if player() ~= owner() then return end
+        if not SFMA.playersESPEnabled then return end
+        
+        for _, ply in pairs(find.allPlayers()) do
+            if not isValid(ply) then continue end
+            if ply == owner() then continue end
+            
+            local pos = ply:getPos():toScreen()
+            if not pos.visible then continue end
+            
+            -- Draw player name
+            render.setFont(playerFont)
+            local nameColor = team.getColor(ply:getTeam())
+            render.setColor(nameColor)
+            render.drawText(pos.x, pos.y - 10, ply:getName(), 1)
+            
+            -- Get player mode (PVP or BUILD)
+            local mode = "UNKNOWN"
+            local modeColor = Color(255, 255, 255)
+            
+            if ply.isPVP and ply:isPVP() then
+                mode = "PVP"
+                modeColor = Color(180, 0, 255) -- purple
+            elseif ply.isBUILD and ply:isBUILD() then
+                mode = "BUILD"
+                modeColor = Color(255, 100, 200) -- pink
+            end
+            
+            -- Get entity count
+            local entCount = 0
+            for _, ent in pairs(find.all()) do
+                if isValid(ent) and isValid(ent:getOwner()) and ent:getOwner() == ply then
+                    entCount = entCount + 1
+                end
+            end
+            
+            -- Get hours played
+            local secondsPlayed = 0
+            if ply.getTimePlayed then
+                secondsPlayed = ply:getTimePlayed() or 0
+            end
+            local hoursPlayed = math.floor(secondsPlayed / 3600)
+            
+            -- Draw mode
+            render.setFont(smallFont)
+            render.setColor(modeColor)
+            render.drawText(pos.x, pos.y + 5, mode, 1)
+            
+            -- Draw entity count
+            local entColor = getEntityCountColor(entCount)
+            render.setColor(entColor)
+            render.drawText(pos.x - 40, pos.y + 18, "Ents: " .. entCount, 1)
+            
+            -- Draw hours played
+            local hoursColor = getHoursColor(hoursPlayed)
+            render.setColor(hoursColor)
+            render.drawText(pos.x + 40, pos.y + 18, hoursPlayed .. "h", 1)
+        end
+    end)
+    -- ============= END PLAYERS ESP SYSTEM =============
+    
 end -- CLIENT
 
 return SFMA
